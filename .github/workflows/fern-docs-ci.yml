@@ -46,5 +46,7 @@ jobs:
         run: npm ci
 
       - name: Validate Fern configuration
+        env:
+          FERN_TOKEN: ${{ secrets.DOCS_FERN_TOKEN }}
         working-directory: ./fern
         run: npm run check
