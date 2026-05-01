@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 from asyncio import sleep
 from typing import (
@@ -468,6 +469,8 @@ RETRY_ERROR_CODES = RATE_LIMIT_ERROR_CODES + [500]
 class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
     """This is just a stub class that wraps around aiohttp"""
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     base_url: str
     api_key: str
 
@@ -475,6 +478,23 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
         default=False,
         description="Set this to true if this particular client is only used to call internal NeMo Gym servers.",
     )
+    max_concurrent_requests: Optional[int] = Field(
+        default=None,
+        description=(
+            "Cap on in-flight upstream requests from this client (process-local "
+            "asyncio.Semaphore). Set on rate-limited endpoints (e.g. Gemini) to "
+            "stay under quota regardless of caller fan-out. None = unlimited."
+        ),
+    )
+    _semaphore: Optional[asyncio.Semaphore] = None
+
+    def _get_semaphore(self) -> Optional[asyncio.Semaphore]:
+        # Lazy init: asyncio.Semaphore needs a running event loop.
+        if self.max_concurrent_requests is None:
+            return None
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+        return self._semaphore
 
     async def _request(self, **request_kwargs: Dict) -> ClientResponse:
         request_kwargs = request_kwargs | {
@@ -484,6 +504,13 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
             "_internal": self.internal,
         }
 
+        sem = self._get_semaphore()
+        if sem is not None:
+            async with sem:
+                return await self._request_with_retry(**request_kwargs)
+        return await self._request_with_retry(**request_kwargs)
+
+    async def _request_with_retry(self, **request_kwargs: Dict) -> ClientResponse:
         max_num_tries = MAX_NUM_TRIES
         tries = 0
         while tries < max_num_tries:
