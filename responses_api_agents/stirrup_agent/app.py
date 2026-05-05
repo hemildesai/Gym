@@ -22,6 +22,7 @@ construction, scoring, response building) is delegated to a
 from __future__ import annotations
 
 import asyncio
+import logging
 import shutil
 import sys
 import tempfile
@@ -29,6 +30,9 @@ import time
 from asyncio import Semaphore
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+
+LOGGER = logging.getLogger(__name__)
 
 import ray
 from fastapi import Request
@@ -338,8 +342,28 @@ async def _run_stirrup_agent(
         file_contents = read_deliverable_files(output_dir)
 
         # Build multimodal content blocks (base64 PDFs/images) for visual judging.
-        # These are serializable dicts that cross the Ray boundary.
+        # These are serializable dicts that cross the Ray boundary. Note:
+        # ``convert_deliverables_to_content_blocks`` produces PDF siblings as a
+        # side effect on the host but unlinks them after building blocks — so
+        # the persisted task_dir would not see those PDFs even if host
+        # libreoffice were available.
         deliverable_content_blocks = convert_deliverables_to_content_blocks(output_dir)
+
+        # Office → PDF preconvert inside the agent's Apptainer SIF (libreoffice
+        # baked in there; not in the gym evaluation container).
+        if uses_container and exec_provider is not None:
+            sif_path = getattr(exec_provider, "_sif_path", None) or getattr(exec_provider, "sif_path", None)
+            if sif_path:
+                from responses_api_agents.stirrup_agent.preconvert import (
+                    preconvert_office_in_dir_via_apptainer,
+                )
+
+                n_ok, n_fail, errors = await preconvert_office_in_dir_via_apptainer(output_dir, sif_path)
+                if n_ok or n_fail:
+                    LOGGER.info("preconvert via apptainer: ok=%d fail=%d", n_ok, n_fail)
+                if n_fail:
+                    for msg in errors[:5]:
+                        LOGGER.warning("preconvert fail: %s", msg)
 
         # Optionally persist full task artifacts for comparison judging / human review.
         if persist_deliverables_dir:
