@@ -28,6 +28,35 @@ from nemo_gym.openai_utils import (
 )
 
 
+def _policy_trace_turn(
+    policy_trace_rollout_details: Optional[List[Dict[str, Any]]],
+    turn_index: int,
+) -> tuple[List[int], List[int], List[float]] | None:
+    if not policy_trace_rollout_details:
+        return None
+    if len(policy_trace_rollout_details) != 1:
+        return None
+
+    rollout_detail = policy_trace_rollout_details[0]
+    prompt_token_ids = rollout_detail.get("prompt_token_ids") or []
+    completion_token_ids = rollout_detail.get("completion_token_ids") or []
+    logprobs = rollout_detail.get("logprobs") or []
+    if turn_index >= len(prompt_token_ids) or turn_index >= len(completion_token_ids):
+        return None
+
+    turn_prompt_ids = prompt_token_ids[turn_index] or []
+    turn_completion_ids = completion_token_ids[turn_index] or []
+    turn_logprobs = logprobs[turn_index] if turn_index < len(logprobs) else []
+    if not turn_prompt_ids or not turn_completion_ids:
+        return None
+    if turn_logprobs and len(turn_completion_ids) != len(turn_logprobs):
+        raise ValueError(
+            "Policy trace turn has mismatched completion token and logprob counts: "
+            f"{len(turn_completion_ids)} tokens, {len(turn_logprobs)} logprobs"
+        )
+    return turn_prompt_ids, turn_completion_ids, turn_logprobs or []
+
+
 @dataclass
 class HarborAgentUtils:
     @staticmethod
@@ -298,7 +327,10 @@ class HarborAgentUtils:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def trajectory_to_responses(trajectory: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def trajectory_to_responses(
+        trajectory: Dict[str, Any],
+        policy_trace_rollout_details: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
         """Convert ATIF trajectory agent steps to NeMo Gym output items.
 
         Each agent step in the trajectory is converted to:
@@ -338,6 +370,9 @@ class HarborAgentUtils:
             prompt_token_ids = metrics.get("prompt_token_ids")
             completion_token_ids = metrics.get("completion_token_ids")
             logprobs = metrics.get("logprobs")
+            policy_trace_turn = _policy_trace_turn(policy_trace_rollout_details, agent_step_index)
+            if policy_trace_turn is not None:
+                prompt_token_ids, completion_token_ids, logprobs = policy_trace_turn
             has_token_details = prompt_token_ids or completion_token_ids or logprobs
 
             if has_token_details:
@@ -404,6 +439,49 @@ class HarborAgentUtils:
 
         return output_items
 
+    @staticmethod
+    def policy_trace_to_responses(policy_trace_rollout_details: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Build minimal trainable response messages directly from policy trace."""
+        output_items: List[Dict[str, Any]] = []
+        if len(policy_trace_rollout_details) != 1:
+            return output_items
+
+        rollout_detail = policy_trace_rollout_details[0]
+        prompt_token_ids = rollout_detail.get("prompt_token_ids") or []
+        completion_token_ids = rollout_detail.get("completion_token_ids") or []
+        logprobs = rollout_detail.get("logprobs") or []
+        for turn_index, turn_completion_ids in enumerate(completion_token_ids):
+            if turn_index >= len(prompt_token_ids):
+                break
+            turn_prompt_ids = prompt_token_ids[turn_index] or []
+            turn_logprobs = logprobs[turn_index] if turn_index < len(logprobs) else []
+            if not turn_prompt_ids or not turn_completion_ids:
+                continue
+            if turn_logprobs and len(turn_completion_ids) != len(turn_logprobs):
+                raise ValueError(
+                    "Policy trace turn has mismatched completion token and logprob counts: "
+                    f"{len(turn_completion_ids)} tokens, {len(turn_logprobs)} logprobs"
+                )
+            message = NeMoGymResponseOutputMessageForTraining(
+                id=f"cht_{uuid4().hex[:12]}",
+                content=[
+                    NeMoGymResponseOutputText(
+                        annotations=[],
+                        text="",
+                        type="output_text",
+                        logprobs=None,
+                    )
+                ],
+                role="assistant",
+                status="completed",
+                type="message",
+                prompt_token_ids=turn_prompt_ids,
+                generation_token_ids=turn_completion_ids,
+                generation_log_probs=turn_logprobs or [],
+            )
+            output_items.append(message.model_dump())
+        return output_items
+
     # ------------------------------------------------------------------ #
     #  Main entry point — trial result → NeMo Gym output items            #
     # ------------------------------------------------------------------ #
@@ -412,14 +490,26 @@ class HarborAgentUtils:
     def trial_result_to_responses(
         trial_result: Dict[str, Any],
         trajectory: Optional[Dict[str, Any]] = None,
+        policy_trace_rollout_details: Optional[List[Dict[str, Any]]] = None,
+        output_mode: str = "trajectory",
     ) -> List[Dict[str, Any]]:
         """Convert Harbor trial output to NeMo Gym output items.
 
-        All output is derived from the ATIF trajectory.  Token IDs and
-        logprobs are read from each step's ``metrics`` (populated by
-        ``NemoGymLLM``).  Returns an empty list when no trajectory is
-        available.
+        ``output_mode="trajectory"`` keeps the rich ATIF trajectory and overlays
+        policy trace token/logprob details when they are available.
+        ``output_mode="policy_trace"`` returns the compact trainable policy
+        trace only; raw Harbor trajectory artifacts remain on disk under the
+        Harbor jobs directory. This keeps high-concurrency eval coordinators
+        lightweight while preserving the data needed for RL training.
         """
+        if output_mode not in {"trajectory", "policy_trace"}:
+            raise ValueError(f"Unsupported Harbor response_output_mode={output_mode!r}")
+        if output_mode == "policy_trace":
+            if policy_trace_rollout_details:
+                return HarborAgentUtils.policy_trace_to_responses(policy_trace_rollout_details)
+            return []
         if trajectory and trajectory.get("steps"):
-            return HarborAgentUtils.trajectory_to_responses(trajectory)
+            return HarborAgentUtils.trajectory_to_responses(trajectory, policy_trace_rollout_details)
+        if policy_trace_rollout_details:
+            return HarborAgentUtils.policy_trace_to_responses(policy_trace_rollout_details)
         return []

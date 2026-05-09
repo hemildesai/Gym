@@ -17,12 +17,15 @@ from pathlib import Path
 from typing import Any, Literal
 
 from harbor.agents.terminus_2.terminus_2 import Terminus2
-from harbor.environments.base import BaseEnvironment
-from harbor.llms.base import BaseLLM
+from harbor.environments.base import BaseSandbox
+from harbor.llms.base import BaseLLM, LLMBackend
 from harbor.models.agent.context import AgentContext
 
 from responses_api_agents.harbor_agent.custom_agents.llms.nemo_gym_llm import NemoGymLLM
-from responses_api_agents.harbor_agent.custom_envs.singularity.singularity import MemoryLimitExceededError
+
+
+class MemoryLimitExceededError(Exception):
+    """Compatibility shim for non-Singularity Harbor environments."""
 
 
 class Terminus2NemoGym(Terminus2):
@@ -59,13 +62,14 @@ class Terminus2NemoGym(Terminus2):
         *args: Any,
         **kwargs: Any,
     ) -> None:
-        if llm is None:
+        self._provided_nemo_gym_llm: BaseLLM | None = llm
+        if self._provided_nemo_gym_llm is None:
             if model_name is None:
                 raise ValueError("model_name is required for Terminus2NemoGym")
             if api_base is None:
                 raise ValueError("api_base is required for Terminus2NemoGym when llm is not provided")
 
-            llm = NemoGymLLM(
+            self._provided_nemo_gym_llm = NemoGymLLM(
                 model_name=model_name,
                 api_base=api_base,
                 collect_rollout_details=collect_rollout_details,
@@ -93,13 +97,31 @@ class Terminus2NemoGym(Terminus2):
             tmux_pane_height=tmux_pane_height,
             store_all_messages=store_all_messages,
             record_terminal_session=record_terminal_session,
-            llm=llm,
             interleaved_thinking=interleaved_thinking,
             *args,
             **kwargs,
         )
 
-    async def run(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
+    def _init_llm(
+        self,
+        llm_backend: LLMBackend | str,
+        model_name: str,
+        temperature: float,
+        collect_rollout_details: bool,
+        llm_kwargs: dict | None,
+        api_base: str | None,
+        session_id: str | None,
+        max_thinking_tokens: int | None,
+        reasoning_effort: str | None,
+        model_info: dict | None,
+        use_responses_api: bool,
+    ) -> BaseLLM:
+        """Return the prebuilt Gym LLM instead of Terminus2's LiteLLM backend."""
+        if self._provided_nemo_gym_llm is None:
+            raise ValueError("Terminus2NemoGym LLM was not initialized")
+        return self._provided_nemo_gym_llm
+
+    async def run(self, instruction: str, environment: BaseSandbox, context: AgentContext) -> None:
         """Override run() to gracefully handle agent errors.
 
         The parent's run() has a finally block that saves rollout_details and

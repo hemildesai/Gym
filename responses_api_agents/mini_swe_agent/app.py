@@ -15,6 +15,7 @@
 import asyncio
 import json
 import sys
+import traceback
 from asyncio import Semaphore
 from os import environ, getenv, makedirs
 from pathlib import Path
@@ -51,15 +52,19 @@ from responses_api_agents.mini_swe_agent.utils import MiniSWEAgentUtils
 
 class MiniSWEAgentConfig(BaseResponsesAPIAgentConfig):
     model_server: ModelServerRef
-    env: Literal["docker", "singularity"]
+    env: Literal["docker", "singularity", "opensandbox"]
     concurrency: int
     cache_dir_template: Optional[str] = None
+    sandbox_provider: Optional[dict[str, Any]] = None
+    sandbox_spec: Optional[dict[str, Any]] = None
+    sandbox_environment_kwargs: Optional[dict[str, Any]] = None
     run_golden: bool = False
     step_timeout: int = 600
     eval_timeout: int = 1800
     skip_if_exists: bool = False
     step_limit: int = 250
     collapse_limit: int = 3
+    runner_num_cpus: float = 1.0
 
 
 class MiniSWEAgentRunRequest(BaseRunRequest):
@@ -82,6 +87,18 @@ class MiniSWEAgentVerifyResponse(BaseVerifyResponse):
 )
 def runner_ray_remote(runner: Callable, params: dict[str, Any]) -> Any:
     return runner(**params)
+
+
+def run_swegym_with_optional_opensandbox(**params: Any) -> Any:
+    if params.get("env") == "opensandbox":
+        from minisweagent.environments import ENV_MAP
+
+        from responses_api_agents.mini_swe_agent.opensandbox_env import (
+            OpenSandboxMiniSWEEnvironment,
+        )
+
+        ENV_MAP["opensandbox"] = OpenSandboxMiniSWEEnvironment
+    return run_swegym(**params)
 
 
 class MiniSWEAgent(SimpleResponsesAPIAgent):
@@ -138,6 +155,17 @@ class MiniSWEAgent(SimpleResponsesAPIAgent):
             top_p = body.responses_create_params.top_p or default_model_kwargs["top_p"]
 
             output_file_dir = f"{Path.cwd()}/results/{subset}/{policy_model_name}"
+            config_path = mini_swe_config_path
+            if env == "opensandbox":
+                if self.config.sandbox_provider is None:
+                    raise ValueError("env=opensandbox requires sandbox_provider")
+                config.setdefault("environment", {}).update(self.config.sandbox_environment_kwargs or {})
+                config["environment"]["provider"] = self.config.sandbox_provider
+                config["environment"]["spec"] = self.config.sandbox_spec or {}
+                config_output_dir = Path(output_file_dir) / "_configs"
+                config_output_dir.mkdir(parents=True, exist_ok=True)
+                config_path = config_output_dir / f"{instance_id}.opensandbox.yaml"
+                config_path.write_text(yaml.safe_dump(config, sort_keys=False))
 
             if self.config.skip_if_exists:
                 if Path(f"{output_file_dir}/{instance_id}/{instance_id}.json").exists():
@@ -180,6 +208,7 @@ class MiniSWEAgent(SimpleResponsesAPIAgent):
                     env=env,
                     run_golden=run_golden,
                     instance_id=instance_id,
+                    config=config_path,
                     # TODO: add this later
                     instance_dict=body.model_dump(),
                     responses_create_params=json.dumps(reseponses_create_params_dict),
@@ -188,7 +217,10 @@ class MiniSWEAgent(SimpleResponsesAPIAgent):
                     step_limit=step_limit,
                     collapse_limit=collapse_limit,
                 )
-                future = runner_ray_remote.remote(run_swegym, params)
+                future = runner_ray_remote.options(num_cpus=self.config.runner_num_cpus).remote(
+                    run_swegym_with_optional_opensandbox,
+                    params,
+                )
                 result = await asyncio.to_thread(ray.get, future)
                 result = result[instance_id]
                 messages = result["messages"]
@@ -196,8 +228,9 @@ class MiniSWEAgent(SimpleResponsesAPIAgent):
                 reward = 1.0 if MiniSWEAgentUtils.is_resolved(instance_id, result["eval_report"]) else 0.0
 
             except Exception as e:
-                print(f"Error running swegym: {e}")
-                result = None
+                error_info = {"error": str(e), "traceback": traceback.format_exc()}
+                print(f"Error running swegym: {e}\n{error_info['traceback']}", flush=True)
+                result = {"eval_report": error_info}
                 messages = []
                 responses = []
                 reward = 0.0

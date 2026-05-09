@@ -13,11 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import sys
 import tempfile
 from asyncio import Semaphore
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
@@ -28,6 +31,8 @@ from responses_api_agents.harbor_agent.app import (
     HarborAgent,
     HarborAgentConfig,
     HarborRunRequest,
+    _run_harbor_job_sync,
+    _run_harbor_job_with_backend,
 )
 from responses_api_agents.harbor_agent.utils import HarborAgentUtils
 
@@ -261,6 +266,7 @@ def _make_run_request(instance_id="scientific::test_task_123", **kwargs) -> Harb
 
 _GLOBAL_CONFIG = {
     "policy_model_name": "test_model",
+    "policy_base_url": "http://real-policy:8000/v1",
     "test_model_server": {"responses_api_models": {"vllm_model": {"host": "policy-host", "port": 9000}}},
 }
 
@@ -280,6 +286,7 @@ def _harbor_run_mocks(
     ):
         mock_gc.return_value = _GLOBAL_CONFIG
         mock_ray.remote.return_value = MagicMock()
+        mock_ray.options.return_value.remote.return_value = MagicMock()
 
         if side_effect:
             mock_to_thread.side_effect = side_effect
@@ -293,6 +300,111 @@ def _harbor_run_mocks(
             mock_to_thread.return_value = trial_dir
 
         yield
+
+
+class _FakeHarborConfig:
+    def __init__(self, **kwargs: Any) -> None:
+        self._kwargs = kwargs
+
+    def model_dump(self, mode: str = "json") -> dict[str, Any]:
+        return {key: _dump_fake_harbor_value(value) for key, value in self._kwargs.items()}
+
+
+def _dump_fake_harbor_value(value: Any) -> Any:
+    if isinstance(value, _FakeHarborConfig):
+        return value.model_dump(mode="json")
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, list):
+        return [_dump_fake_harbor_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _dump_fake_harbor_value(item) for key, item in value.items()}
+    return value
+
+
+@contextmanager
+def _fake_harbor_config_modules():
+    job_config_module = ModuleType("harbor.models.job.config")
+    job_config_module.DatasetConfig = _FakeHarborConfig
+    job_config_module.JobConfig = _FakeHarborConfig
+
+    trial_config_module = ModuleType("harbor.models.trial.config")
+    trial_config_module.AgentConfig = _FakeHarborConfig
+    trial_config_module.EnvironmentConfig = _FakeHarborConfig
+    trial_config_module.VerifierConfig = _FakeHarborConfig
+
+    modules = {
+        "harbor": ModuleType("harbor"),
+        "harbor.models": ModuleType("harbor.models"),
+        "harbor.models.job": ModuleType("harbor.models.job"),
+        "harbor.models.job.config": job_config_module,
+        "harbor.models.trial": ModuleType("harbor.models.trial"),
+        "harbor.models.trial.config": trial_config_module,
+    }
+    with patch.dict(sys.modules, modules):
+        yield
+
+
+class TestRunnerBackend:
+    async def test_async_backend_runs_without_thread_or_ray(self) -> None:
+        with (
+            patch("responses_api_agents.harbor_agent.app.run_harbor_job") as mock_run,
+            patch("responses_api_agents.harbor_agent.app.runner_ray_remote") as mock_ray,
+        ):
+            mock_run.return_value = "/tmp/trial"
+
+            trial_dir = await _run_harbor_job_with_backend(
+                backend="async",
+                job_config_dict={"job_name": "mock_job"},
+                runner_num_cpus=0.0,
+            )
+
+        assert trial_dir == "/tmp/trial"
+        mock_run.assert_awaited_once_with({"job_name": "mock_job"})
+        mock_ray.options.assert_not_called()
+
+    async def test_thread_backend_runs_without_ray_worker(self) -> None:
+        with (
+            ThreadPoolExecutor(max_workers=1) as executor,
+            patch("responses_api_agents.harbor_agent.app._run_harbor_job_sync") as mock_sync,
+            patch("responses_api_agents.harbor_agent.app.runner_ray_remote") as mock_ray,
+        ):
+            mock_sync.return_value = "/tmp/trial"
+
+            trial_dir = await _run_harbor_job_with_backend(
+                backend="thread",
+                job_config_dict={"job_name": "mock_job"},
+                runner_num_cpus=0.0,
+                thread_executor=executor,
+            )
+
+        assert trial_dir == "/tmp/trial"
+        mock_sync.assert_called_once_with({"job_name": "mock_job"})
+        mock_ray.options.assert_not_called()
+
+    async def test_ray_backend_uses_bounded_ray_options(self) -> None:
+        future = MagicMock()
+        with (
+            patch("responses_api_agents.harbor_agent.app.asyncio.to_thread") as mock_to_thread,
+            patch("responses_api_agents.harbor_agent.app.runner_ray_remote") as mock_ray,
+            patch("responses_api_agents.harbor_agent.app.ray.get") as mock_ray_get,
+        ):
+            mock_ray.options.return_value.remote.return_value = future
+            mock_to_thread.return_value = "/tmp/trial"
+
+            trial_dir = await _run_harbor_job_with_backend(
+                backend="ray",
+                job_config_dict={"job_name": "mock_job"},
+                runner_num_cpus=0.25,
+            )
+
+        assert trial_dir == "/tmp/trial"
+        mock_ray.options.assert_called_once_with(num_cpus=0.25)
+        mock_ray.options.return_value.remote.assert_called_once_with(
+            _run_harbor_job_sync,
+            {"job_config_dict": {"job_name": "mock_job"}},
+        )
+        mock_to_thread.assert_awaited_once_with(mock_ray_get, future)
 
 
 # ===========================================================================
@@ -320,6 +432,7 @@ class TestApp:
         assert response.response.id.startswith("resp_")
         assert len(response.responses_create_params.input) == 1
         assert "Fix the bug" in response.responses_create_params.input[0].content
+        assert response.metadata["agent_result"] == {"n_input_tokens": 100, "n_output_tokens": 50}
 
     async def test_run_without_token_details(self):
         server = _make_server()
@@ -591,6 +704,94 @@ class TestTrajectoryToResponsesRawContent:
         assert items[1]["call_id"] == "call_0_1"
 
 
+class TestPolicyTraceOverlay:
+    def test_policy_trace_supplies_training_fields(self) -> None:
+        policy_trace = [
+            {
+                "prompt_token_ids": [[1, 2, 3], [6, 7]],
+                "completion_token_ids": [[4, 5], [8, 9, 10]],
+                "logprobs": [[-0.1, -0.2], [-0.3, -0.4, -0.5]],
+            }
+        ]
+        items = HarborAgentUtils.trial_result_to_responses(
+            DEFAULT_TRIAL_RESULT,
+            TRAJECTORY_NO_TOKEN_DETAILS,
+            policy_trace,
+        )
+
+        assert items[0]["prompt_token_ids"] == [1, 2, 3]
+        assert items[0]["generation_token_ids"] == [4, 5]
+        assert items[0]["generation_log_probs"] == [-0.1, -0.2]
+        assert items[3]["prompt_token_ids"] == [6, 7]
+        assert items[3]["generation_token_ids"] == [8, 9, 10]
+        assert items[3]["generation_log_probs"] == [-0.3, -0.4, -0.5]
+
+    def test_policy_trace_fallback_without_trajectory(self) -> None:
+        policy_trace = [
+            {
+                "prompt_token_ids": [[1, 2, 3]],
+                "completion_token_ids": [[4, 5]],
+                "logprobs": [[-0.1, -0.2]],
+            }
+        ]
+        items = HarborAgentUtils.trial_result_to_responses(DEFAULT_TRIAL_RESULT, None, policy_trace)
+
+        assert len(items) == 1
+        assert items[0]["prompt_token_ids"] == [1, 2, 3]
+        assert items[0]["generation_token_ids"] == [4, 5]
+        assert items[0]["generation_log_probs"] == [-0.1, -0.2]
+
+    def test_policy_trace_output_mode_skips_rich_trajectory(self) -> None:
+        policy_trace = [
+            {
+                "prompt_token_ids": [[1, 2, 3]],
+                "completion_token_ids": [[4, 5]],
+                "logprobs": [[-0.1, -0.2]],
+            }
+        ]
+        items = HarborAgentUtils.trial_result_to_responses(
+            DEFAULT_TRIAL_RESULT,
+            DEFAULT_TRAJECTORY,
+            policy_trace,
+            output_mode="policy_trace",
+        )
+
+        assert len(items) == 1
+        assert items[0]["prompt_token_ids"] == [1, 2, 3]
+        assert items[0]["generation_token_ids"] == [4, 5]
+        assert all(item["type"] == "message" for item in items)
+
+    def test_policy_trace_output_mode_does_not_fallback_to_trajectory(self) -> None:
+        items = HarborAgentUtils.trial_result_to_responses(
+            DEFAULT_TRIAL_RESULT,
+            DEFAULT_TRAJECTORY,
+            None,
+            output_mode="policy_trace",
+        )
+
+        assert items == []
+
+    def test_rejects_unknown_output_mode(self) -> None:
+        with pytest.raises(ValueError, match="Unsupported Harbor response_output_mode"):
+            HarborAgentUtils.trial_result_to_responses(
+                DEFAULT_TRIAL_RESULT,
+                DEFAULT_TRAJECTORY,
+                output_mode="unknown",
+            )
+
+    def test_policy_trace_rejects_mismatched_logprobs(self) -> None:
+        policy_trace = [
+            {
+                "prompt_token_ids": [[1, 2, 3]],
+                "completion_token_ids": [[4, 5]],
+                "logprobs": [[-0.1]],
+            }
+        ]
+
+        with pytest.raises(ValueError, match="mismatched completion token and logprob counts"):
+            HarborAgentUtils.trial_result_to_responses(DEFAULT_TRIAL_RESULT, None, policy_trace)
+
+
 # ===========================================================================
 #  Merge reasoning tests
 # ===========================================================================
@@ -603,3 +804,71 @@ class TestMergeMessageAndReasoning:
     def test_returns_message_when_no_reasoning(self) -> None:
         assert HarborAgentUtils._merge_message_and_reasoning("answer", None) == "answer"
         assert HarborAgentUtils._merge_message_and_reasoning("answer", "") == "answer"
+
+
+class TestBuildJobConfig:
+    def test_agent_setup_timeout_override(self) -> None:
+        server = _make_server(harbor_agent_override_setup_timeout=1800)
+
+        with _fake_harbor_config_modules():
+            job_config = server._build_job_config(
+                "scientific",
+                "test_task_123",
+                "Qwen/Qwen3.5-27B",
+                "http://policy:8000/v1",
+                job_name="job",
+                jobs_dir=Path("/tmp/jobs"),
+                policy_target_base_url="http://real-policy:8000/v1",
+            )
+
+        agent = job_config["agents"][0]
+
+        assert agent["override_setup_timeout_sec"] == 1800.0
+
+    def test_policy_proxy_config_for_installed_agent(self) -> None:
+        server = _make_server(
+            harbor_agent_name="mini-swe-agent",
+            harbor_agent_import_path=None,
+            harbor_agent_model_name="openai/{model_name}",
+            harbor_policy_proxy={
+                "port": 8765,
+                "trace_file": "policy_trace.jsonl",
+                "script_path": "/tmp/nemo_rl_policy_proxy.py",
+                "backend": "stdlib",
+                "litellm_provider": "openai",
+                "upstream_model_name": "{model_name}",
+                "responses_upstream_api": "responses",
+                "generation_temperature": 0.6,
+                "generation_top_p": 0.95,
+                "generation_top_k": 20,
+                "generation_chat_template_kwargs": {"enable_thinking": True},
+                "force_generation_params": True,
+                "env": {
+                    "OPENAI_BASE_URL": "{proxy_base_url}",
+                    "OPENAI_API_BASE": "{proxy_base_url}",
+                    "OPENAI_API_KEY": "sandbox-proxy",
+                },
+            },
+        )
+
+        with _fake_harbor_config_modules():
+            job_config = server._build_job_config(
+                "scientific",
+                "test_task_123",
+                "Qwen/Qwen3.5-27B",
+                "http://policy:8000/v1",
+                job_name="job",
+                jobs_dir=Path("/tmp/jobs"),
+                policy_target_base_url="http://real-policy:8000/v1",
+            )
+
+        agent = job_config["agents"][0]
+        environment_kwargs = job_config["environment"]["kwargs"]
+        policy_proxy = environment_kwargs["policy_proxy"]
+
+        assert agent["model_name"] == "openai/Qwen/Qwen3.5-27B"
+        assert agent["env"]["OPENAI_BASE_URL"] == "http://127.0.0.1:8765/v1"
+        assert policy_proxy["target_base_url"] == "http://real-policy:8000/v1"
+        assert policy_proxy["trace_path"] == "/logs/agent/policy_trace.jsonl"
+        assert policy_proxy["upstream_model_name"] == "Qwen/Qwen3.5-27B"
+        assert policy_proxy["generation_chat_template_kwargs"] == {"enable_thinking": True}

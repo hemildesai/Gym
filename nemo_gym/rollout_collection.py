@@ -64,6 +64,13 @@ class SharedRolloutCollectionConfig(BaseNeMoGymCLIConfig):
         default=True,
         description="Upload the rollouts to W&B. Sometimes this should be off because the rollouts are massive. Default: True",
     )
+    retain_full_rollouts_in_memory: bool = Field(
+        default=False,
+        description=(
+            "Keep full rollout objects in memory until collection finishes. "
+            "Disable for large agent trajectories; full rollouts are still streamed to output_jsonl_fpath."
+        ),
+    )
 
 
 class E2ERolloutCollectionConfig(SharedRolloutCollectionConfig):
@@ -141,6 +148,25 @@ def _rollout_request_debug_summary(row: Dict[str, Any]) -> Dict[str, Any]:
         "agent_name": agent_ref.get("name") if isinstance(agent_ref, dict) else None,
     }
     return {k: v for k, v in summary.items() if v is not None}
+
+
+def _row_for_aggregate_metrics(row: Dict[str, Any]) -> Dict[str, Any]:
+    entry = {
+        TASK_INDEX_KEY_NAME: row[TASK_INDEX_KEY_NAME],
+        ROLLOUT_INDEX_KEY_NAME: row[ROLLOUT_INDEX_KEY_NAME],
+    }
+    if AGENT_REF_KEY_NAME in row:
+        entry[AGENT_REF_KEY_NAME] = row[AGENT_REF_KEY_NAME]
+    return entry
+
+
+def _result_for_aggregate_metrics(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only fields used by aggregate metrics and score summaries."""
+    entry = {k: v for k, v in result.items() if k not in ("response", "responses_create_params")}
+    usage = (result.get("response") or {}).get("usage")
+    if usage:
+        entry["response"] = {"usage": usage}
+    return entry
 
 
 class RolloutCollectionHelper(BaseModel):
@@ -234,20 +260,37 @@ class RolloutCollectionHelper(BaseModel):
 
     def _load_from_cache(
         self, config: RolloutCollectionConfig
-    ) -> Tuple[List[Dict], List[Dict], List[Dict], List[List[str]]]:
+    ) -> Tuple[List[Dict], List[Dict], List[Dict], List[List[bytes]]]:
         with config.materialized_jsonl_fpath.open() as f:
             original_input_rows = list(map(orjson.loads, f))
-        with Path(config.output_jsonl_fpath).open("rb") as f:
-            result_strs = [[line.strip()] for line in f]
-        results = [orjson.loads(p[0]) for p in result_strs]
 
+        should_upload_rollouts = config.upload_rollouts_to_wandb and get_wandb_run()
+        result_strs = []
+        results = []
+        seen_rows = set()
         get_key = lambda r: (r[TASK_INDEX_KEY_NAME], r[ROLLOUT_INDEX_KEY_NAME])
 
-        seen_rows = set(map(get_key, results))
+        with Path(config.output_jsonl_fpath).open("rb") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                result = orjson.loads(line)
+                seen_rows.add(get_key(result))
+                if config.retain_full_rollouts_in_memory:
+                    results.append(result)
+                else:
+                    results.append(_result_for_aggregate_metrics(result))
+                if should_upload_rollouts:
+                    result_strs.append([line])
+
         input_rows = [row for row in original_input_rows if get_key(row) not in seen_rows]
 
         key_to_row = dict(zip(map(get_key, original_input_rows), original_input_rows))
-        rows = [key_to_row[get_key(result)] for result in results]
+        if config.retain_full_rollouts_in_memory:
+            rows = [key_to_row[get_key(result)] for result in results]
+        else:
+            rows = [_row_for_aggregate_metrics(key_to_row[get_key(result)]) for result in results]
 
         print(
             f"""Resumed from cache. Found:
@@ -281,7 +324,7 @@ class RolloutCollectionHelper(BaseModel):
 
             rows: List[Dict] = []
             results: List[Dict] = []
-            result_strs: List[List[str]] = []
+            result_strs: List[List[bytes]] = []
 
             input_rows = self._preprocess_rows_from_config(config)
             # Returned rows are sorted by (r[TASK_INDEX_KEY_NAME], r[ROLLOUT_INDEX_KEY_NAME])
@@ -298,41 +341,48 @@ class RolloutCollectionHelper(BaseModel):
             semaphore = Semaphore(config.num_samples_in_parallel)
 
         output_fpath.parent.mkdir(exist_ok=True, parents=True)
+        should_upload_rollouts = config.upload_rollouts_to_wandb and get_wandb_run()
 
         pcts_to_print = [20, 40, 60, 80, 90, 95, 98, 99, 100]
         counts_left = Counter(r[AGENT_REF_KEY_NAME]["name"] for r in input_rows)
-        results_file = output_fpath.open("ab")
-        for future in self.run_examples(input_rows, semaphore=semaphore):
-            row, result = await future
+        with output_fpath.open("ab") as results_file:
+            for future in self.run_examples(input_rows, semaphore=semaphore):
+                row, result = await future
 
-            result[TASK_INDEX_KEY_NAME] = row[TASK_INDEX_KEY_NAME]
-            result[ROLLOUT_INDEX_KEY_NAME] = row[ROLLOUT_INDEX_KEY_NAME]
-            result[AGENT_REF_KEY_NAME] = row[AGENT_REF_KEY_NAME]
+                result[TASK_INDEX_KEY_NAME] = row[TASK_INDEX_KEY_NAME]
+                result[ROLLOUT_INDEX_KEY_NAME] = row[ROLLOUT_INDEX_KEY_NAME]
+                result[AGENT_REF_KEY_NAME] = row[AGENT_REF_KEY_NAME]
 
-            rows.append(row)
-            results.append(result)
-            result_strs.append([orjson.dumps(result)])
-            results_file.write(result_strs[-1][0] + b"\n")
-            results_file.flush()
+                result_bytes = orjson.dumps(result)
+                results_file.write(result_bytes + b"\n")
+                results_file.flush()
 
-            counts_left[row[AGENT_REF_KEY_NAME]["name"]] -= 1
-            if counts_left[row[AGENT_REF_KEY_NAME]["name"]] <= 0:
-                counts_left.pop(row[AGENT_REF_KEY_NAME]["name"])
+                if config.retain_full_rollouts_in_memory:
+                    rows.append(row)
+                    results.append(result)
+                else:
+                    rows.append(_row_for_aggregate_metrics(row))
+                    results.append(_result_for_aggregate_metrics(result))
 
-            current_pct = 100 * len(results) / len(input_rows)
-            if pcts_to_print and current_pct >= pcts_to_print[0]:
-                while pcts_to_print and current_pct >= pcts_to_print[0]:
-                    pcts_to_print.pop(0)
+                if should_upload_rollouts:
+                    result_strs.append([result_bytes])
 
-                top_left = counts_left.most_common(5)  # Fix to top 3 for now.
-                if top_left:
-                    top_left_str = "\n".join(f"{i + 1}. {k}: {v}" for i, (k, v) in enumerate(top_left))
-                    # Use tqdm.write here so we can print properly with tqdm being used.
-                    tqdm.write(f"Examples left:\n{top_left_str}")
+                counts_left[row[AGENT_REF_KEY_NAME]["name"]] -= 1
+                if counts_left[row[AGENT_REF_KEY_NAME]["name"]] <= 0:
+                    counts_left.pop(row[AGENT_REF_KEY_NAME]["name"])
 
-        results_file.close()
+                current_pct = 100 * len(results) / len(input_rows)
+                if pcts_to_print and current_pct >= pcts_to_print[0]:
+                    while pcts_to_print and current_pct >= pcts_to_print[0]:
+                        pcts_to_print.pop(0)
 
-        if config.upload_rollouts_to_wandb and get_wandb_run():  # pragma: no cover
+                    top_left = counts_left.most_common(5)  # Fix to top 3 for now.
+                    if top_left:
+                        top_left_str = "\n".join(f"{i + 1}. {k}: {v}" for i, (k, v) in enumerate(top_left))
+                        # Use tqdm.write here so we can print properly with tqdm being used.
+                        tqdm.write(f"Examples left:\n{top_left_str}")
+
+        if should_upload_rollouts:  # pragma: no cover
             print("Uploading rollouts to W&B. This may take a few minutes if your data is large.")
             get_wandb_run().log({"Rollouts": Table(data=result_strs, columns=["Rollout"])})
         del result_strs
@@ -380,11 +430,7 @@ Aggregate metrics: {aggregate_metrics_fpath}""")
             # Strip heavyweight fields before sending, but preserve response.usage
             stripped = []
             for r in agent_result_list:
-                entry = {k: v for k, v in r.items() if k not in ("response", "responses_create_params")}
-                usage = (r.get("response") or {}).get("usage")
-                if usage:
-                    entry["response"] = {"usage": usage}
-                stripped.append(entry)
+                stripped.append(_result_for_aggregate_metrics(r))
 
             agg_request = AggregateMetricsRequest(verify_responses=stripped)
             agg_response = await server_client.post(

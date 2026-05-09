@@ -65,10 +65,12 @@ harbor_agent:
       #                to this maximum. Shorter per-task timeouts are respected.
       # timeout_multiplier: Multiplied after override/cap resolution.
       harbor_agent_override_timeout: null               # Override agent timeout (seconds)
+      harbor_agent_override_setup_timeout: null         # Override agent setup timeout (seconds)
       harbor_agent_max_timeout: null           # Cap agent timeout (seconds)
       harbor_verifier_override_timeout: null            # Override verifier timeout (seconds)
       harbor_verifier_max_timeout: null        # Cap verifier timeout (seconds)
       harbor_timeout_multiplier: null          # Multiplier (null = 1.0)
+      harbor_run_timeout: null                 # Outer /run guardrail timeout (seconds)
 
       # Output root directory for Harbor job artifacts.
       harbor_jobs_dir: "/path/to/Gym/responses_api_agents/harbor_agent/jobs"

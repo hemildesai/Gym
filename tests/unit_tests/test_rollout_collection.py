@@ -519,20 +519,16 @@ class TestRolloutCollection:
                 {"_ng_task_index": 2, "_ng_rollout_index": 1, "input": True},
             ],
             [
-                {"_ng_task_index": 0, "_ng_rollout_index": 0, "input": True},
-                {"_ng_task_index": 0, "_ng_rollout_index": 1, "input": True},
-                {"_ng_task_index": 1, "_ng_rollout_index": 1, "input": True},
+                {"_ng_task_index": 0, "_ng_rollout_index": 0},
+                {"_ng_task_index": 0, "_ng_rollout_index": 1},
+                {"_ng_task_index": 1, "_ng_rollout_index": 1},
             ],
             [
                 {"_ng_task_index": 0, "_ng_rollout_index": 0, "output": True},
                 {"_ng_task_index": 0, "_ng_rollout_index": 1, "output": True},
                 {"_ng_task_index": 1, "_ng_rollout_index": 1, "output": True},
             ],
-            [
-                [orjson.dumps({"_ng_task_index": 0, "_ng_rollout_index": 0, "output": True})],
-                [orjson.dumps({"_ng_task_index": 0, "_ng_rollout_index": 1, "output": True})],
-                [orjson.dumps({"_ng_task_index": 1, "_ng_rollout_index": 1, "output": True})],
-            ],
+            [],
         )
 
         assert expected_results == actual_returned_results
