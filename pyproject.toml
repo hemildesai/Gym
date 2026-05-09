@@ -187,6 +187,11 @@ dependencies = [
     # License: Apache 2.0 https://github.com/andrew-d/python-multipart/blob/master/LICENSE.txt
     "python-multipart>=0.0.22",
 
+    # Tenacity: Retry helpers used by sandbox providers.
+    # Updated: Sat May 09, 2026 with tenacity==9.1.4
+    # License: Apache 2.0 https://github.com/jd/tenacity/blob/master/LICENSE
+    "tenacity>=9.1.4",
+
     # wandb: E2E rollout collection data and metrics upload
     # Updated: Tue Feb 17, 2026 with wandb==0.25.0
     # License: MIT https://github.com/wandb/wandb/blob/f8acf479342b6aa8217dd0833bb32190b11c14bc/LICENSE
@@ -388,7 +393,7 @@ ng_reinstall = "nemo_gym.cli:reinstall"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["benchmarks", "resources_servers", "responses_api_agents", "responses_api_models", "nemo_gym", "nemo_rl", "nemo_rl.*"]
+include = ["benchmarks", "resources_servers", "responses_api_agents", "responses_api_models", "nemo_gym", "nemo_gym.*"]
 
 ################################################
 # Testing

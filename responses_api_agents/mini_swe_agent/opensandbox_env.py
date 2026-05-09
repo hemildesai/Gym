@@ -95,7 +95,7 @@ class OpenSandboxMiniSWEEnvironment:
         config_class: type = OpenSandboxMiniSWEEnvironmentConfig,
         **kwargs: Any,
     ) -> None:
-        from nemo_rl.sandbox.providers import SandboxSpec, create_provider
+        from nemo_gym.sandbox.providers import SandboxSpec, create_provider
 
         self.config = config_class(**kwargs)
         if not self.config.provider:

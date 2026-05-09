@@ -14,13 +14,13 @@
 
 """Sandbox provider registry."""
 
-from nemo_rl.sandbox.providers.base import (
+from nemo_gym.sandbox.providers.base import (
     SandboxExecResult,
     SandboxHandle,
     SandboxProvider,
     SandboxSpec,
 )
-from nemo_rl.sandbox.providers.registry import (
+from nemo_gym.sandbox.providers.registry import (
     create_provider,
     get_provider_class,
     list_providers,

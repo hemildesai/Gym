@@ -35,14 +35,14 @@ import tomllib
 from typing import Any, cast
 from uuid import uuid4
 
-from nemo_rl.sandbox.config import SandboxConfig, SandboxProviderConfig
-from nemo_rl.sandbox.integrations.policy_proxy import (
+from nemo_gym.sandbox.config import SandboxConfig, SandboxProviderConfig
+from nemo_gym.sandbox.integrations.policy_proxy import (
     POLICY_PROXY_SCRIPT,
     SandboxTrajectory,
     load_policy_trace_jsonl,
 )
-from nemo_rl.sandbox.integrations.trajectory import SandboxRolloutContext
-from nemo_rl.sandbox.observability import (
+from nemo_gym.sandbox.integrations.trajectory import SandboxRolloutContext
+from nemo_gym.sandbox.observability import (
     SandboxResourceSampler,
     build_recorder_from_config,
     current_recorder,
@@ -57,9 +57,9 @@ from nemo_rl.sandbox.observability import (
     set_current_recorder,
     use_recorder,
 )
-from nemo_rl.sandbox.observability.render import safe_report_name
-from nemo_rl.sandbox.providers import SandboxHandle, SandboxSpec, create_provider
-from nemo_rl.sandbox.providers.opensandbox import (
+from nemo_gym.sandbox.observability.render import safe_report_name
+from nemo_gym.sandbox.providers import SandboxHandle, SandboxSpec, create_provider
+from nemo_gym.sandbox.providers.opensandbox import (
     OpenSandboxBatchCreateError,
     OpenSandboxCreateVerificationError,
 )
@@ -234,7 +234,7 @@ async def _materialize_preallocated_handle(
         )
     return result
 _PROGRESS_PROBE_SCRIPT = (
-    resources.files("nemo_rl.sandbox.integrations")
+    resources.files("nemo_gym.sandbox.integrations")
     .joinpath("sandbox_progress_probe.py")
     .read_text(encoding="utf-8")
 )
@@ -1624,7 +1624,7 @@ def _trial_config_for_row(
 
     environment_cfg = config_dict.setdefault("environment", {})
     environment_cfg["import_path"] = (
-        "nemo_rl.sandbox.integrations.harbor:OpenSandboxHarborSandbox"
+        "nemo_gym.sandbox.integrations.harbor:OpenSandboxHarborSandbox"
     )
     environment_cfg["type"] = None
     environment_kwargs = environment_cfg.setdefault("kwargs", {})

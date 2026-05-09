@@ -31,8 +31,8 @@ from tenacity import (
     wait_random_exponential,
 )
 
-from nemo_rl.sandbox.observability import observability_span, record_event
-from nemo_rl.sandbox.providers.base import SandboxSpec
+from nemo_gym.sandbox.observability import observability_span, record_event
+from nemo_gym.sandbox.providers.base import SandboxSpec
 
 LOGGER = logging.getLogger(__name__)
 

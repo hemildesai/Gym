@@ -27,7 +27,7 @@ from typing import Any, NotRequired, TypedDict
 
 
 POLICY_PROXY_SCRIPT = (
-    resources.files("nemo_rl.sandbox.integrations")
+    resources.files("nemo_gym.sandbox.integrations")
     .joinpath("policy_proxy_server.py")
     .read_text(encoding="utf-8")
 )

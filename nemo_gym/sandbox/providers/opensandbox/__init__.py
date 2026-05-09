@@ -12,4 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compatibility namespace for sandbox integrations shared with NeMo Gym."""
+"""OpenSandbox provider package."""
+
+from nemo_gym.sandbox.providers.opensandbox.provider import (
+    OpenSandboxBatchCreateError,
+    OpenSandboxCreateTimeoutError,
+    OpenSandboxCreateVerificationError,
+    OpenSandboxProvider,
+)
+
+__all__ = [
+    "OpenSandboxBatchCreateError",
+    "OpenSandboxCreateTimeoutError",
+    "OpenSandboxCreateVerificationError",
+    "OpenSandboxProvider",
+]

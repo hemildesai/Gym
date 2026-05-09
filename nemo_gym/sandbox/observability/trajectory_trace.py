@@ -22,7 +22,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from nemo_rl.sandbox.observability.events import command_attributes, stable_hash
+from nemo_gym.sandbox.observability.events import command_attributes, stable_hash
 
 
 _RETURN_CODE_RE = re.compile(r"<returncode>(-?\d+)</returncode>")

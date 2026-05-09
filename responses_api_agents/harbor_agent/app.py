@@ -607,7 +607,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
             except Exception as e:
                 if handles:
                     try:
-                        from nemo_rl.sandbox.integrations.harbor import (
+                        from nemo_gym.sandbox.integrations.harbor import (
                             _close_preallocated_handles,
                         )
 
@@ -701,7 +701,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 if handle_ref is None:
                     return key, {"error": "handle_not_found"}
                 try:
-                    from nemo_rl.sandbox.integrations.harbor import (
+                    from nemo_gym.sandbox.integrations.harbor import (
                         _PROGRESS_PROBE_PATH,
                         _PROGRESS_PROBE_SCRIPT,
                     )
@@ -829,7 +829,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
         trace_path = trial_dir / "agent" / trace_file
         if not trace_path.exists():
             return None
-        from nemo_rl.sandbox.integrations.policy_proxy import load_policy_trace_jsonl
+        from nemo_gym.sandbox.integrations.policy_proxy import load_policy_trace_jsonl
 
         return list(load_policy_trace_jsonl(trace_path))
 
@@ -951,7 +951,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
         prepared_environment: bool = False,
         policy_proxy_started: bool = False,
     ) -> None:
-        from nemo_rl.sandbox.integrations.harbor import (
+        from nemo_gym.sandbox.integrations.harbor import (
             _PREALLOCATED_HANDLES,
             _preallocated_handle_reference,
         )
@@ -969,7 +969,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
         self._sandbox_pool_handles[token] = handle_ref
 
     async def _sandbox_pool_materialize_handle(self, handle_ref: Any) -> Any:
-        from nemo_rl.sandbox.integrations.harbor import _materialize_preallocated_handle
+        from nemo_gym.sandbox.integrations.harbor import _materialize_preallocated_handle
 
         if self._sandbox_pool_provider is None:
             raise RuntimeError("Sandbox pool provider is not initialized")
@@ -993,7 +993,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
         *,
         delete: bool,
     ) -> None:
-        from nemo_rl.sandbox.integrations.harbor import (
+        from nemo_gym.sandbox.integrations.harbor import (
             _PREALLOCATED_HANDLES,
             _close_preallocated_handles,
         )
@@ -1052,7 +1052,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
             _PREALLOCATED_HANDLES.pop(token, None)
 
     def _create_sandbox_pool_provider(self) -> Any:
-        from nemo_rl.sandbox.providers import create_provider
+        from nemo_gym.sandbox.providers import create_provider
 
         environment_kwargs = self.config.harbor_environment_kwargs or {}
         provider_config = environment_kwargs.get("provider")
@@ -1086,7 +1086,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
         *,
         policy_proxy_config: Optional[dict[str, Any]] = None,
     ) -> None:
-        from nemo_rl.sandbox.integrations.harbor import (
+        from nemo_gym.sandbox.integrations.harbor import (
             install_policy_proxy_client_config_for_handle,
             prepare_harbor_sandbox_environment,
             start_policy_proxy_for_handle,
@@ -1109,7 +1109,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
             phase="prewarm",
         )
         if policy_proxy_config is not None:
-            from nemo_rl.sandbox.observability import observability_span
+            from nemo_gym.sandbox.observability import observability_span
 
             async with observability_span(
                 "sandbox.policy_proxy.prewarm_start",
@@ -1128,8 +1128,8 @@ class HarborAgent(SimpleResponsesAPIAgent):
 
     def _build_sandbox_pool_spec(self, instance_id: str) -> Any:
         from harbor.models.task.config import TaskConfig
-        from nemo_rl.sandbox.integrations.harbor import _kubernetes_dns_label, _rewrite_sandbox_image
-        from nemo_rl.sandbox.providers import SandboxSpec
+        from nemo_gym.sandbox.integrations.harbor import _kubernetes_dns_label, _rewrite_sandbox_image
+        from nemo_gym.sandbox.providers import SandboxSpec
 
         _, task_name = self._parse_instance_id(instance_id)
         task_dir = self._sandbox_pool_task_dir(instance_id)
@@ -1177,7 +1177,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
         )
 
     async def _cleanup_prewarmed_sandboxes_locked(self, *, delete: bool) -> int:
-        from nemo_rl.sandbox.integrations.harbor import (
+        from nemo_gym.sandbox.integrations.harbor import (
             _PREALLOCATED_HANDLES,
             _close_preallocated_handles,
             _close_provider_resources,

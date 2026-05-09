@@ -20,7 +20,7 @@ import asyncio
 import json
 from typing import Any
 
-from nemo_rl.sandbox.observability.recorder import (
+from nemo_gym.sandbox.observability.recorder import (
     SandboxEventRecorder,
     suppress_observability_events,
 )

@@ -23,7 +23,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from nemo_rl.sandbox.observability.summary import load_jsonl
+from nemo_gym.sandbox.observability.summary import load_jsonl
 
 
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")

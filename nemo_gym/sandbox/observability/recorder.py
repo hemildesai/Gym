@@ -27,19 +27,19 @@ import threading
 import time
 from typing import Any, Iterator
 
-from nemo_rl.sandbox.observability.events import (
+from nemo_gym.sandbox.observability.events import (
     SCHEMA_VERSION,
     SandboxEvent,
     ResourceSample,
     safe_attributes,
     stable_hash,
 )
-from nemo_rl.sandbox.observability.summary import (
+from nemo_gym.sandbox.observability.summary import (
     flatten_summary_metrics,
     load_jsonl,
     write_summary,
 )
-from nemo_rl.sandbox.observability.traces import export_trace_artifacts
+from nemo_gym.sandbox.observability.traces import export_trace_artifacts
 
 
 G_CURRENT_RECORDER: ContextVar[SandboxEventRecorder | None] = ContextVar(
@@ -364,7 +364,7 @@ class SandboxEventRecorder:
                 )
         if self.artifacts["enabled"]:
             try:
-                from nemo_rl.sandbox.observability.render import render_reports
+                from nemo_gym.sandbox.observability.render import render_reports
 
                 render_reports(
                     self.output_dir,
@@ -464,45 +464,45 @@ class _OtelSink:
             resource=Resource.create({"service.name": cfg["service_name"]}),
         )
         metrics.set_meter_provider(self._meter_provider)
-        meter = metrics.get_meter("nemo_rl.sandbox.observability")
+        meter = metrics.get_meter("nemo_gym.sandbox.observability")
         self._duration_histogram = meter.create_histogram(
-            "nemo_rl.sandbox.operation.duration",
+            "nemo_gym.sandbox.operation.duration",
             unit="s",
             description="Sandbox operation duration.",
         )
         self._phase_duration_histograms = {
             "startup": meter.create_histogram(
-                "nemo_rl.sandbox.startup.duration",
+                "nemo_gym.sandbox.startup.duration",
                 unit="s",
                 description="Sandbox startup duration.",
             ),
             "setup": meter.create_histogram(
-                "nemo_rl.sandbox.setup.duration",
+                "nemo_gym.sandbox.setup.duration",
                 unit="s",
                 description="Sandbox setup duration.",
             ),
             "execution": meter.create_histogram(
-                "nemo_rl.sandbox.execution.duration",
+                "nemo_gym.sandbox.execution.duration",
                 unit="s",
                 description="Sandbox execution duration.",
             ),
             "llm": meter.create_histogram(
-                "nemo_rl.sandbox.llm.request.duration",
+                "nemo_gym.sandbox.llm.request.duration",
                 unit="s",
                 description="Sandbox LLM request duration.",
             ),
         }
         self._counter = meter.create_counter(
-            "nemo_rl.sandbox.events",
+            "nemo_gym.sandbox.events",
             description="Sandbox event counts.",
         )
         self._memory_histogram = meter.create_histogram(
-            "nemo_rl.sandbox.resource.memory.usage_bytes",
+            "nemo_gym.sandbox.resource.memory.usage_bytes",
             unit="By",
             description="Sandbox memory usage samples.",
         )
         self._cpu_histogram = meter.create_histogram(
-            "nemo_rl.sandbox.resource.cpu.utilization",
+            "nemo_gym.sandbox.resource.cpu.utilization",
             unit="1",
             description="Sandbox CPU utilization samples.",
         )

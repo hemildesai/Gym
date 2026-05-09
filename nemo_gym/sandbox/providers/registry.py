@@ -16,8 +16,8 @@
 
 from typing import TypeAlias
 
-from nemo_rl.sandbox.config import SandboxProviderConfig
-from nemo_rl.sandbox.providers.base import SandboxProvider
+from nemo_gym.sandbox.config import SandboxProviderConfig
+from nemo_gym.sandbox.providers.base import SandboxProvider
 
 ProviderClass: TypeAlias = type[SandboxProvider]
 
@@ -58,7 +58,7 @@ def list_providers() -> list[str]:
 
 
 def _register_builtins() -> None:
-    from nemo_rl.sandbox.providers.opensandbox import OpenSandboxProvider
+    from nemo_gym.sandbox.providers.opensandbox import OpenSandboxProvider
 
     if "opensandbox" not in G_PROVIDER_REGISTRY:
         register_provider("opensandbox", OpenSandboxProvider)

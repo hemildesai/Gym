@@ -15,7 +15,7 @@
 """Provider-facing sandbox protocol.
 
 Providers are the only layer that talks to runtime and infrastructure APIs.
-Harbor, NeMo Gym, and other harnesses sit under ``nemo_rl.sandbox.integrations``.
+Harbor, NeMo Gym, and other harnesses sit under ``nemo_gym.sandbox.integrations``.
 """
 
 from dataclasses import dataclass, field

@@ -14,13 +14,13 @@
 
 """Sandbox eval observability helpers."""
 
-from nemo_rl.sandbox.observability.events import (
+from nemo_gym.sandbox.observability.events import (
     SCHEMA_VERSION,
     classify_command,
     command_attributes,
     stable_hash,
 )
-from nemo_rl.sandbox.observability.recorder import (
+from nemo_gym.sandbox.observability.recorder import (
     SandboxEventRecorder,
     build_recorder_from_config,
     build_recorder_from_env,
@@ -38,14 +38,14 @@ from nemo_rl.sandbox.observability.recorder import (
     suppress_observability_events,
     use_recorder,
 )
-from nemo_rl.sandbox.observability.resource import SandboxResourceSampler
-from nemo_rl.sandbox.observability.summary import (
+from nemo_gym.sandbox.observability.resource import SandboxResourceSampler
+from nemo_gym.sandbox.observability.summary import (
     flatten_summary_metrics,
     summarize_observability,
     write_summary,
 )
-from nemo_rl.sandbox.observability.traces import export_trace_artifacts
-from nemo_rl.sandbox.observability.trajectory_trace import (
+from nemo_gym.sandbox.observability.traces import export_trace_artifacts
+from nemo_gym.sandbox.observability.trajectory_trace import (
     extract_agent_tool_spans,
     ingest_agent_trajectory_events,
 )

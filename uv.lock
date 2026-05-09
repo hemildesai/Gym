@@ -1392,6 +1392,7 @@ dependencies = [
     { name = "python-multipart" },
     { name = "ray", extra = ["default"] },
     { name = "rich" },
+    { name = "tenacity" },
     { name = "tqdm" },
     { name = "urllib3" },
     { name = "uvicorn" },
@@ -1458,6 +1459,7 @@ requires-dist = [
     { name = "requests-mock", marker = "extra == 'dev'" },
     { name = "rich" },
     { name = "ruff", marker = "extra == 'dev'" },
+    { name = "tenacity", specifier = ">=9.1.4" },
     { name = "tqdm" },
     { name = "urllib3", specifier = ">=2.6.3" },
     { name = "uvicorn" },
@@ -2736,6 +2738,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/5b/b3/84bc7d8af6b50e6c365f1593fe4a01245f4bfb2178040261c6429db0b46b/swagger_plugin_for_sphinx-6.0.0.tar.gz", hash = "sha256:70366c610648cede5ef482922c9c97c86c99746b9edf33e4ec13fab23d820251", size = 16026, upload-time = "2025-10-16T06:26:09.95Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/51/f0/1098f6628bbe04b086ce59692d09b116ec751286eb7d33e88c5bf0c2e210/swagger_plugin_for_sphinx-6.0.0-py3-none-any.whl", hash = "sha256:35dc646d759a44ce78aefde2fe34f54e7b8c3439d0a52541a6a8b9924a711832", size = 11253, upload-time = "2025-10-16T06:26:08.504Z" },
+]
+
+[[package]]
+name = "tenacity"
+version = "9.1.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/47/c6/ee486fd809e357697ee8a44d3d69222b344920433d3b6666ccd9b374630c/tenacity-9.1.4.tar.gz", hash = "sha256:adb31d4c263f2bd041081ab33b498309a57c77f9acf2db65aadf0898179cf93a", size = 49413, upload-time = "2026-02-07T10:45:33.841Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d7/c1/eb8f9debc45d3b7918a32ab756658a0904732f75e555402972246b0b8e71/tenacity-9.1.4-py3-none-any.whl", hash = "sha256:6095a360c919085f28c6527de529e76a06ad89b23659fa881ae0649b867a9d55", size = 28926, upload-time = "2026-02-07T10:45:32.24Z" },
 ]
 
 [[package]]

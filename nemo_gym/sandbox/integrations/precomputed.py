@@ -16,8 +16,8 @@
 
 from typing import Any
 
-from nemo_rl.sandbox.config import SandboxConfig
-from nemo_rl.sandbox.integrations.policy_proxy import SandboxTrajectory
+from nemo_gym.sandbox.config import SandboxConfig
+from nemo_gym.sandbox.integrations.policy_proxy import SandboxTrajectory
 
 
 def collect_precomputed_trajectories(

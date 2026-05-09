@@ -17,9 +17,9 @@
 from dataclasses import dataclass
 from typing import Any
 
-from nemo_rl.sandbox.config import SandboxConfig
-from nemo_rl.sandbox.integrations.policy_proxy import SandboxTrajectory
-from nemo_rl.sandbox.integrations.precomputed import collect_precomputed_trajectories
+from nemo_gym.sandbox.config import SandboxConfig
+from nemo_gym.sandbox.integrations.policy_proxy import SandboxTrajectory
+from nemo_gym.sandbox.integrations.precomputed import collect_precomputed_trajectories
 
 
 @dataclass(frozen=True)
@@ -41,7 +41,7 @@ def collect_sandbox_trajectories(
     if integration_name == "precomputed":
         return collect_precomputed_trajectories(rows, sandbox_config)
     if integration_name == "harbor":
-        from nemo_rl.sandbox.integrations.harbor import collect_harbor_trajectories
+        from nemo_gym.sandbox.integrations.harbor import collect_harbor_trajectories
 
         return collect_harbor_trajectories(rows, sandbox_config, context)
 

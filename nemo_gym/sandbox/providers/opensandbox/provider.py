@@ -30,12 +30,12 @@ from tenacity import (
     wait_random_exponential,
 )
 
-from nemo_rl.sandbox.providers.base import (
+from nemo_gym.sandbox.providers.base import (
     SandboxExecResult,
     SandboxHandle,
     SandboxSpec,
 )
-from nemo_rl.sandbox.providers.opensandbox.batchsandbox import (
+from nemo_gym.sandbox.providers.opensandbox.batchsandbox import (
     BatchSandboxClient,
     BatchSandboxReplica,
     DEFAULT_BATCHSANDBOX_NAMESPACE,
@@ -45,7 +45,7 @@ from nemo_rl.sandbox.providers.opensandbox.batchsandbox import (
     build_batchsandbox_manifest,
     endpoint_with_port,
 )
-from nemo_rl.sandbox.observability import (
+from nemo_gym.sandbox.observability import (
     command_attributes,
     current_recorder,
     observability_span,

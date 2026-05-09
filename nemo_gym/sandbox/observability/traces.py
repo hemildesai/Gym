@@ -21,11 +21,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-from nemo_rl.sandbox.observability.events import stable_hash
-from nemo_rl.sandbox.observability.summary import load_jsonl
+from nemo_gym.sandbox.observability.events import stable_hash
+from nemo_gym.sandbox.observability.summary import load_jsonl
 
 
-_SCOPE_NAME = "nemo_rl.sandbox.observability"
+_SCOPE_NAME = "nemo_gym.sandbox.observability"
 _SCOPE_VERSION = "1"
 _SEMANTIC_LANES = {
     "foreground": (1, "Foreground tool / agent"),
@@ -416,7 +416,7 @@ def _standardized_attributes(
     sandbox_id = standardized.get("sandbox_id")
     if sandbox_id:
         standardized.setdefault(
-            "nemo_rl.sandbox_id_hash",
+            "nemo_gym.sandbox_id_hash",
             stable_hash(str(sandbox_id), length=16),
         )
 
