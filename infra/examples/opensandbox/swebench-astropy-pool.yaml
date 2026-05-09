@@ -1,0 +1,108 @@
+apiVersion: sandbox.opensandbox.io/v1alpha1
+kind: Pool
+metadata:
+  name: swebench-astropy-pool
+  namespace: opensandbox
+  labels:
+    app.kubernetes.io/name: opensandbox
+    app.kubernetes.io/component: swebench-astropy-pool
+spec:
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: opensandbox
+        app.kubernetes.io/component: swebench-astropy-sandbox
+    spec:
+      schedulerName: default-scheduler
+      dnsPolicy: ClusterFirst
+      tolerations:
+        - operator: Exists
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nodeGroup
+                    operator: In
+                    values: [customer-cpu]
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: [amd64]
+              - matchExpressions:
+                  - key: karpenter.sh/nodepool
+                    operator: In
+                    values: [cpu]
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: [amd64]
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: nodeGroup
+                    operator: In
+                    values: [customer-cpu]
+      volumes:
+        - name: sandbox-storage
+          emptyDir: {}
+        - name: opensandbox-bin
+          emptyDir: {}
+        - name: sandbox-logs
+          emptyDir: {}
+      initContainers:
+        - name: task-executor-installer
+          image: sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/task-executor:v0.1.0
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              cp /workspace/server /opt/opensandbox/bin/task-executor
+              chmod +x /opt/opensandbox/bin/task-executor
+          volumeMounts:
+            - name: opensandbox-bin
+              mountPath: /opt/opensandbox/bin
+        - name: execd-installer
+          image: opensandbox/execd:v1.0.15
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              cp ./execd /opt/opensandbox/bin/execd
+              cp ./bootstrap.sh /opt/opensandbox/bin/bootstrap.sh
+              chmod +x /opt/opensandbox/bin/execd
+              chmod +x /opt/opensandbox/bin/bootstrap.sh
+          volumeMounts:
+            - name: opensandbox-bin
+              mountPath: /opt/opensandbox/bin
+      containers:
+        - name: sandbox
+          image: swebench/sweb.eval.x86_64.astropy_1776_astropy-12907:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              /opt/opensandbox/bin/task-executor -listen-addr=0.0.0.0:5758 >/tmp/task-executor.log 2>&1
+          env:
+            - name: SANDBOX_MAIN_CONTAINER
+              value: main
+            - name: EXECD_ENVS
+              value: /opt/opensandbox/.env
+            - name: EXECD
+              value: /opt/opensandbox/bin/execd
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+          volumeMounts:
+            - name: sandbox-storage
+              mountPath: /var/lib/sandbox
+            - name: opensandbox-bin
+              mountPath: /opt/opensandbox/bin
+            - name: sandbox-logs
+              mountPath: /workspace/logs
+  capacitySpec:
+    bufferMax: 2
+    bufferMin: 0
+    poolMax: 3
+    poolMin: 1

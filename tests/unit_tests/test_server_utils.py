@@ -204,6 +204,19 @@ class TestServerUtils:
         get_global_config_dict_mock.assert_called_once()
         ray_init_mock.assert_called_once_with(address="ray://test-address:10001", ignore_reinit_error=True)
 
+    def test_initialize_ray_disabled(self, monkeypatch: MonkeyPatch) -> None:
+        ray_is_initialized_mock = self._mock_ray_return_value(monkeypatch, False)
+        ray_init_mock = self._mock_ray_init(monkeypatch)
+
+        get_global_config_dict_mock = MagicMock(return_value=DictConfig({"ray_enabled": False}))
+        monkeypatch.setattr(nemo_gym.server_utils, "get_global_config_dict", get_global_config_dict_mock)
+
+        initialize_ray()
+
+        ray_is_initialized_mock.assert_called_once()
+        get_global_config_dict_mock.assert_called_once()
+        ray_init_mock.assert_not_called()
+
     def test_initialize_ray_without_address(self, monkeypatch: MonkeyPatch) -> None:
         ray_is_initialized_mock = self._mock_ray_return_value(monkeypatch, False)
 

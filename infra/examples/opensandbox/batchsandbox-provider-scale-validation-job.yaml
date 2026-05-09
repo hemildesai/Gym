@@ -1,0 +1,126 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: nemo-gym-batchsandbox-provider-scale-
+  namespace: default
+  labels:
+    app.kubernetes.io/name: nemo-gym-sandbox-eval
+    app.kubernetes.io/component: batchsandbox-provider-scale-validation
+    kai.scheduler/queue: backfill
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nemo-gym-sandbox-eval
+        app.kubernetes.io/component: batchsandbox-provider-scale-validation
+        kai.scheduler/queue: backfill
+    spec:
+      restartPolicy: Never
+      schedulerName: default-scheduler
+      serviceAccountName: nemo-gym-endpoint-registry
+      tolerations:
+        - operator: Exists
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nodeGroup
+                    operator: In
+                    values: [customer-cpu]
+              - matchExpressions:
+                  - key: karpenter.sh/nodepool
+                    operator: In
+                    values: [cpu]
+                  - key: karpenter.k8s.aws/instance-generation
+                    operator: Gt
+                    values: ["5"]
+      containers:
+        - name: scale-validator
+          image: mirror.gcr.io/astral/uv:python3.12-bookworm-slim
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              WORKSPACE_ROOT="${GYM_EVAL_WORKSPACE_ROOT:-/mnt/rl-workspace/gym-eval}"
+              DEPS_ROOT="${GYM_DEPS_ROOT:-/mnt/rl-workspace/gym/deps}"
+              GYM_DIR="${GYM_DIR:-${DEPS_ROOT}/Gym}"
+              GYM_INFRA_DIR="${GYM_INFRA_DIR:-${GYM_DIR}/infra/examples/opensandbox}"
+              OPENSANDBOX_PYTHON_DIR="${OPENSANDBOX_PYTHON_DIR:-${DEPS_ROOT}/opensandbox-python}"
+              cd "${GYM_DIR}"
+
+              RUN_ID="${JOB_NAME:-batchsandbox-provider-scale}"
+              REPLICAS="${REPLICAS:-1024}"
+              OUT_ROOT="${BATCHSANDBOX_SCALE_OUT_ROOT:-${WORKSPACE_ROOT}/batchsandbox_provider_scale}"
+              OUT_DIR="${OUT_ROOT}/${RUN_ID}"
+              SUMMARY="${OUT_DIR}/summary-${REPLICAS}.json"
+              mkdir -p "${OUT_DIR}"
+
+              export UV_CACHE_DIR="${UV_CACHE_DIR:-${WORKSPACE_ROOT}/.uv-cache}"
+              export XDG_DATA_HOME="${XDG_DATA_HOME:-${WORKSPACE_ROOT}/.local/share}"
+              export PYTHONPATH="${GYM_DIR}:${OPENSANDBOX_PYTHON_DIR}:${OPENSANDBOX_PYTHON_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
+
+              uv run --no-project \
+                --with kubernetes \
+                --with tenacity \
+                --with-editable "${GYM_DIR}" \
+                --with-editable "${OPENSANDBOX_PYTHON_DIR}" \
+                python "${GYM_INFRA_DIR}/batchsandbox_provider_scale_validate.py" \
+                  --replicas "${REPLICAS}" \
+                  --batch-mode batchsandbox \
+                  --run-id "${RUN_ID}" \
+                  --output "${SUMMARY}" \
+                  --owner "${BATCHSANDBOX_SCALE_OWNER:-nemo-gym}" \
+                  --provider-request-timeout-s 900 \
+                  --provider-create-request-timeout-s 900 \
+                  --provider-create-timeout-s 1200 \
+                  --provider-create-probe-timeout-s 30 \
+                  --batchsandbox-execd-image opensandbox/execd:v1.0.15 \
+                  --batch-create-concurrency 64 \
+                  --batch-create-retries 2 \
+                  --batch-create-retry-delay-s 5 \
+                  --batch-create-retry-max-delay-s 45 \
+                  --strong-readiness-timeout-s 1200 \
+                  --progress-timeout-s 300 \
+                  --echo-concurrency 128 \
+                  --echo-timeout-s 30
+
+              echo "summary=${SUMMARY}"
+          env:
+            - name: GYM_EVAL_WORKSPACE_ROOT
+              value: /mnt/rl-workspace/gym-eval
+            - name: GYM_DIR
+              value: /mnt/rl-workspace/gym/deps/Gym
+            - name: OPENSANDBOX_PYTHON_DIR
+              value: /mnt/rl-workspace/gym/deps/opensandbox-python
+            - name: JOB_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['batch.kubernetes.io/job-name']
+            - name: REPLICAS
+              value: "1024"
+            - name: OPENSANDBOX_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: opensandbox-api-key
+                  key: api-key
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+      volumes:
+        - name: rl-workspace
+          persistentVolumeClaim:
+            claimName: rl-workspace

@@ -131,7 +131,10 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
 
     # --- Model routing ---
     # NeMo Gym model server reference used to resolve Harbor model base URL.
-    model_server: ModelServerRef
+    model_server: Optional[ModelServerRef] = None
+    # Direct OpenAI-compatible model base URL for eval paths that do not need a
+    # local NeMo Gym model server.
+    direct_model_base_url: Optional[str] = None
 
 
 class HarborSandboxPrewarmItem(BaseModel):
@@ -814,7 +817,11 @@ class HarborAgent(SimpleResponsesAPIAgent):
         return metadata
 
     def _resolve_model_base_url(self, global_config_dict: Any) -> str:
-        """Resolve model base URL from required model_server reference."""
+        """Resolve model base URL from direct config or a model_server reference."""
+        if self.config.direct_model_base_url:
+            return self.config.direct_model_base_url.rstrip("/")
+        if self.config.model_server is None:
+            raise ValueError("Either direct_model_base_url or model_server must be configured")
         server_name = self.config.model_server.name
         model_server_config = get_first_server_config_dict(
             global_config_dict,

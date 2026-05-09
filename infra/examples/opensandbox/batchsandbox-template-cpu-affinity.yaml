@@ -1,0 +1,34 @@
+# Template mounted into the OpenSandbox server at
+# /etc/opensandbox/example.batchsandbox-template.yaml for direct template-mode
+# BatchSandbox creation. OpenSandbox merges this with per-request image,
+# command, resources, labels, and platform selectors.
+metadata:
+spec:
+  replicas: 1
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - operator: Exists
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nodeGroup
+                    operator: In
+                    values: [customer-cpu]
+              - matchExpressions:
+                  - key: karpenter.sh/nodepool
+                    operator: In
+                    values: [cpu]
+                  - key: karpenter.k8s.aws/instance-generation
+                    operator: Gt
+                    values: ["5"]
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: nodeGroup
+                    operator: In
+                    values: [customer-cpu]

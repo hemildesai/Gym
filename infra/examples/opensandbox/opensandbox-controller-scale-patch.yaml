@@ -1,0 +1,24 @@
+# Strategic merge patch for the live OpenSandbox controller deployment on the
+# currently deployed v0.1.0 image before running 512+ trajectory scale jobs:
+# kubectl patch deployment -n opensandbox-system opensandbox-controller-manager \
+#   --type strategic --patch-file infra/examples/opensandbox/opensandbox-controller-scale-patch.yaml
+#
+# The local OpenSandbox source has controller throughput flags, but the deployed
+# v0.1.0 image rejects them. Keep args on supported flags here and scale only
+# pod resources until the controller image is upgraded.
+spec:
+  template:
+    spec:
+      containers:
+        - name: manager
+          args:
+            - --leader-elect
+            - --health-probe-bind-address=:8081
+            - --zap-log-level=info
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi

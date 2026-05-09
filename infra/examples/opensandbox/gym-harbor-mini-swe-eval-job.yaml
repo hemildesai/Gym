@@ -1,0 +1,976 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: nemo-gym-harbor-mini-swe-eval-
+  namespace: default
+  labels:
+    app.kubernetes.io/name: nemo-gym-sandbox-eval
+    app.kubernetes.io/component: gym-harbor-mini-swe-obs-full
+    app.kubernetes.io/part-of: sandbox-gym-eval
+    sandbox.nemo-gym/benchmark: swebench-verified
+    sandbox.nemo-gym/harness: harbor-mini-swe-agent
+    sandbox.nemo-gym/agent-api: responses
+    kai.scheduler/queue: backfill
+spec:
+  # Keep a single coordinator pod. Sandbox and rollout fanout is controlled by
+  # CONCURRENCY / num_samples_in_parallel inside the pod.
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  activeDeadlineSeconds: 86400
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nemo-gym-sandbox-eval
+        app.kubernetes.io/component: gym-harbor-mini-swe-obs-full
+        app.kubernetes.io/part-of: sandbox-gym-eval
+        sandbox.nemo-gym/benchmark: swebench-verified
+        sandbox.nemo-gym/harness: harbor-mini-swe-agent
+        sandbox.nemo-gym/agent-api: responses
+        kai.scheduler/queue: backfill
+    spec:
+      restartPolicy: Never
+      schedulerName: default-scheduler
+      serviceAccountName: nemo-gym-endpoint-registry
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nodeGroup
+                    operator: In
+                    values: [customer-cpu]
+              - matchExpressions:
+                  - key: karpenter.sh/nodepool
+                    operator: In
+                    values: [cpu]
+                  - key: karpenter.k8s.aws/instance-generation
+                    operator: Gt
+                    values: ["5"]
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: nodeGroup
+                    operator: In
+                    values: [customer-cpu]
+      containers:
+        - name: runner
+          image: mirror.gcr.io/astral/uv:python3.12-bookworm-slim
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+
+              WORKSPACE_ROOT="${GYM_EVAL_WORKSPACE_ROOT:-/mnt/rl-workspace/gym-eval}"
+              DEPS_ROOT="${GYM_DEPS_ROOT:-/mnt/rl-workspace/gym/deps}"
+              GYM_DIR="${GYM_DIR:-${DEPS_ROOT}/Gym}"
+              GYM_INFRA_DIR="${GYM_INFRA_DIR:-${GYM_DIR}/infra/examples/opensandbox}"
+              OPENSANDBOX_PYTHON_DIR="${OPENSANDBOX_PYTHON_DIR:-${DEPS_ROOT}/opensandbox-python}"
+              HARBOR_DIR="${HARBOR_DIR:-${DEPS_ROOT}/harbor}"
+              RUN_ID="$(date -u +%Y%m%d-%H%M%S)-gym-harbor-mini-swe-eval"
+              RUN_DIR="${GYM_EVAL_RUN_DIR:-${WORKSPACE_ROOT}/runs/swebench_verified_harbor/${RUN_ID}}"
+              TASKS_DIR="${HARBOR_TASKS_DIR:-${WORKSPACE_ROOT}/data/harbor_swebench_verified_official}"
+              HARBOR_JOBS_DIR="${HARBOR_JOBS_DIR:-${WORKSPACE_ROOT}/harbor_jobs}"
+              INPUT=${RUN_DIR}/input.jsonl
+              OUTPUT=${RUN_DIR}/rollouts.jsonl
+              LOG_DIR=${RUN_DIR}/logs
+              OBSERVABILITY_DIR=${RUN_DIR}/observability
+              VENV_DIR="${NEMO_GYM_UV_VENV_DIR:-${WORKSPACE_ROOT}/venvs/harbor-mini-swe-py312}"
+              POOL_NAMES_FILE=${RUN_DIR}/opensandbox_pools.txt
+              POOL_FILTER_FILE=${RUN_DIR}/opensandbox_pool_filter.txt
+              export INPUT
+              export POOL_FILTER_FILE
+              export HARBOR_JOBS_DIR
+              CONCURRENCY="${CONCURRENCY:-2}"
+              CREATE_CONCURRENCY="${CREATE_CONCURRENCY:-2}"
+              SDK_MAX_CONNECTIONS="${SDK_MAX_CONNECTIONS:-64}"
+              SDK_MAX_KEEPALIVE_CONNECTIONS="${SDK_MAX_KEEPALIVE_CONNECTIONS:-32}"
+              TASK_LIMIT="${TASK_LIMIT:-2}"
+              TASK_OFFSET="${TASK_OFFSET:-0}"
+              TASK_STRIDE="${TASK_STRIDE:-1}"
+              TASK_SAMPLE_SEED="${TASK_SAMPLE_SEED:-}"
+              EXCLUDE_ROLLOUTS="${EXCLUDE_ROLLOUTS:-}"
+              if [ "${NEMO_GYM_REBUILD_VENVS:-0}" = "1" ]; then
+                rm -rf "${VENV_DIR}"
+              fi
+              mkdir -p "${RUN_DIR}" "${LOG_DIR}" "${OBSERVABILITY_DIR}" "${HARBOR_JOBS_DIR}"
+
+              export UV_CACHE_DIR="${UV_CACHE_DIR:-${WORKSPACE_ROOT}/.uv-cache}"
+              export XDG_DATA_HOME="${XDG_DATA_HOME:-${WORKSPACE_ROOT}/.local/share}"
+              export HF_HOME="${HF_HOME:-${WORKSPACE_ROOT}/hf-cache}"
+              export PYTHONPATH="${GYM_DIR}:${OPENSANDBOX_PYTHON_DIR}:${OPENSANDBOX_PYTHON_DIR}/src:${HARBOR_DIR}:${HARBOR_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
+              export HYDRA_FULL_ERROR=1
+              export PYTHONDONTWRITEBYTECODE=1
+              export NEMO_RL_SANDBOX_OBSERVABILITY_DIR="${NEMO_RL_SANDBOX_OBSERVABILITY_DIR:-${OBSERVABILITY_DIR}}"
+              export NEMO_RL_SANDBOX_OBSERVABILITY_RUN_ID="${NEMO_RL_SANDBOX_OBSERVABILITY_RUN_ID:-${RUN_ID}}"
+              export NEMO_RL_SANDBOX_OBSERVABILITY_RESOURCE_INTERVAL_S="${NEMO_RL_SANDBOX_OBSERVABILITY_RESOURCE_INTERVAL_S:-10}"
+              export NEMO_RL_SANDBOX_OBSERVABILITY_MAX_RENDERED="${NEMO_RL_SANDBOX_OBSERVABILITY_MAX_RENDERED:-100}"
+              export NEMO_RL_SANDBOX_OBSERVABILITY_RENDER_HTML="${NEMO_RL_SANDBOX_OBSERVABILITY_RENDER_HTML:-1}"
+              export NEMO_RL_SANDBOX_OBSERVABILITY_RENDER_PNG="${NEMO_RL_SANDBOX_OBSERVABILITY_RENDER_PNG:-1}"
+              export NEMO_RL_SANDBOX_OBSERVABILITY_EXPORT_OTLP_JSON="${NEMO_RL_SANDBOX_OBSERVABILITY_EXPORT_OTLP_JSON:-1}"
+              export NEMO_RL_SANDBOX_OBSERVABILITY_WANDB="${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB:-0}"
+              export NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_PROJECT="${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_PROJECT:-nemo-gym-sandbox-eval}"
+              export NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_RUN_NAME="${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_RUN_NAME:-${RUN_ID}}"
+              export NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_ARTIFACT="${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_ARTIFACT:-sandbox-observability-${RUN_ID}}"
+              export NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_MAX_TIME_SERIES_POINTS="${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_MAX_TIME_SERIES_POINTS:-20000}"
+              export NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_MAX_TABLE_ROWS="${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_MAX_TABLE_ROWS:-20000}"
+              export NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_MAX_MEDIA_ITEMS="${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_MAX_MEDIA_ITEMS:-40}"
+              export WANDB_PROJECT="${WANDB_PROJECT:-${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_PROJECT}}"
+              export WANDB_NAME="${WANDB_NAME:-${RUN_ID}}"
+              export WANDB_DIR="${WANDB_DIR:-${RUN_DIR}/wandb}"
+              export WANDB_MODE="${WANDB_MODE:-offline}"
+              export NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_LIVE_METRICS="${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_LIVE_METRICS:-0}"
+              export NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_LIVE_INTERVAL_S="${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_LIVE_INTERVAL_S:-30}"
+              export NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_SWE_TIMING="${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_SWE_TIMING:-0}"
+              export NEMO_RL_SANDBOX_OBSERVABILITY_VLLM_LABEL_SELECTOR="${NEMO_RL_SANDBOX_OBSERVABILITY_VLLM_LABEL_SELECTOR:-app.kubernetes.io/name=vllm}"
+              if [ -n "${OBSERVABILITY_OTEL_ENDPOINT:-}" ]; then
+                export NEMO_RL_SANDBOX_OBSERVABILITY_OTEL_ENDPOINT="${OBSERVABILITY_OTEL_ENDPOINT}"
+              fi
+
+              cd "${GYM_DIR}"
+              cat > .rayignore <<'EOF'
+              core
+              core.*
+              *.core
+              __pycache__/
+              .pytest_cache/
+              .mypy_cache/
+              .ruff_cache/
+              results/
+              wandb/
+              EOF
+              cat > responses_api_agents/harbor_agent/.rayignore <<'EOF'
+              core
+              core.*
+              *.core
+              __pycache__/
+              .pytest_cache/
+              .mypy_cache/
+              .ruff_cache/
+              results/
+              wandb/
+              EOF
+              rm -f responses_api_agents/harbor_agent/core responses_api_agents/harbor_agent/core.*
+
+              EXCLUDE_ARGS=()
+              if [ -n "${EXCLUDE_ROLLOUTS:-}" ]; then
+                for exclude_rollouts in ${EXCLUDE_ROLLOUTS}; do
+                  EXCLUDE_ARGS+=(--exclude-rollouts "${exclude_rollouts}")
+                done
+              fi
+              SELECTION_ARGS=(--offset "${TASK_OFFSET}" --stride "${TASK_STRIDE}")
+              if [ -n "${TASK_SAMPLE_SEED:-}" ]; then
+                SELECTION_ARGS+=(--sample-seed "${TASK_SAMPLE_SEED}")
+              fi
+              python3 "${GYM_INFRA_DIR}/prepare_gym_tbench_input.py" \
+                --tasks-dir "${TASKS_DIR}" \
+                --output "${INPUT}" \
+                --limit "${TASK_LIMIT}" \
+                "${SELECTION_ARGS[@]}" \
+                --dataset-alias swebench \
+                "${EXCLUDE_ARGS[@]}"
+              TARGET_ROWS="$(wc -l < "${INPUT}" | tr -d ' ')"
+              if [ "${TARGET_ROWS}" -eq 0 ]; then
+                echo "No remaining rows to collect after applying excludes"
+                exit 0
+              fi
+              if [ "${GYM_SANDBOX_POOL_ENABLED:-0}" = "1" ] \
+                && [ "${GYM_SANDBOX_POOL_ACQUIRE_POLICY:-direct_create}" != "fail_fast" ] \
+                && [ "${ALLOW_DIRECT_CREATE_FOR_EVAL:-0}" != "1" ]; then
+                echo "Eval sandbox pool must use fail_fast; set ALLOW_DIRECT_CREATE_FOR_EVAL=1 only for resilience experiments" >&2
+                exit 1
+              fi
+              if [ "${OPENSANDBOX_GENERATE_HARBOR_TASK_POOLS:-0}" = "1" ] \
+                && [ -z "${OPENSANDBOX_POOL_REF_TEMPLATE:-}" ]; then
+                OPENSANDBOX_GENERATED_POOL_PREFIX="${OPENSANDBOX_GENERATED_POOL_PREFIX:-swefastghcr}"
+                export OPENSANDBOX_POOL_REF_TEMPLATE="${OPENSANDBOX_GENERATED_POOL_PREFIX}-{task_name}-pool"
+              fi
+              POOL_FILTER_ARGS=()
+              if [ -n "${OPENSANDBOX_POOL_REF_TEMPLATE:-}" ]; then
+                python3 - <<'PY'
+              import hashlib
+              import json
+              import os
+              import re
+
+              label_re = re.compile(r"[^a-z0-9-]+")
+              template = os.environ["OPENSANDBOX_POOL_REF_TEMPLATE"]
+              names = []
+              seen = set()
+
+              def dns(value, max_length=63):
+                  sanitized = label_re.sub("-", str(value).lower()).strip("-")
+                  if not sanitized:
+                      return "resource"
+                  if len(sanitized) <= max_length:
+                      return sanitized
+                  digest = hashlib.sha1(sanitized.encode("utf-8")).hexdigest()[:8]
+                  prefix = sanitized[: max_length - len(digest) - 1].rstrip("-")
+                  return f"{prefix}-{digest}" if prefix else digest
+
+              with open(os.environ["INPUT"]) as f:
+                  for line in f:
+                      if not line.strip():
+                          continue
+                      instance_id = json.loads(line)["instance_id"]
+                      task_name = instance_id.split("::", 1)[1]
+                      pool_name = dns(
+                          template.format(
+                              environment_name=task_name,
+                              task_name=task_name,
+                          )
+                      )
+                      if pool_name not in seen:
+                          seen.add(pool_name)
+                          names.append(pool_name)
+
+              with open(os.environ["POOL_FILTER_FILE"], "w") as f:
+                  f.write("\n".join(names) + ("\n" if names else ""))
+              PY
+                POOL_FILTER_ARGS=(--pool-name-file "${POOL_FILTER_FILE}")
+              fi
+
+              UV_RUN=(
+                uv run --python 3.12 --no-project
+                --with-editable "${GYM_DIR}"
+                --with-editable "${OPENSANDBOX_PYTHON_DIR}"
+                --with-editable "${HARBOR_DIR}"
+                --with tenacity
+                --with kubernetes
+                --with docker==7.1.0
+                --with matplotlib
+                --with wandb
+                --with pyyaml
+              )
+              SERVER_PID=""
+              COLLECT_PID=""
+              METRICS_PID=""
+              TIMING_METRICS_PID=""
+              cleanup_prewarmed_sandboxes() {
+                if [ "${GYM_SANDBOX_POOL_ENABLED:-0}" != "1" ]; then
+                  return 0
+                fi
+                if [ -z "${SERVER_PID:-}" ] || ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
+                  return 0
+                fi
+                "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/prewarm_gym_harbor_sandboxes.py" \
+                  cleanup \
+                  --agent-name harbor_agent \
+                  >>"${LOG_DIR}/sandbox_prewarm_cleanup.log" 2>&1 || true
+              }
+              stop_live_metrics() {
+                if [ -n "${METRICS_PID:-}" ] && kill -0 "${METRICS_PID}" >/dev/null 2>&1; then
+                  kill "${METRICS_PID}" >/dev/null 2>&1 || true
+                  wait "${METRICS_PID}" >/dev/null 2>&1 || true
+                fi
+                METRICS_PID=""
+                if [ -n "${TIMING_METRICS_PID:-}" ] && kill -0 "${TIMING_METRICS_PID}" >/dev/null 2>&1; then
+                  kill "${TIMING_METRICS_PID}" >/dev/null 2>&1 || true
+                  wait "${TIMING_METRICS_PID}" >/dev/null 2>&1 || true
+                fi
+                TIMING_METRICS_PID=""
+              }
+              cleanup_job() {
+                local rc=$?
+                stop_live_metrics
+                cleanup_prewarmed_sandboxes
+                if [ -n "${COLLECT_PID:-}" ] && kill -0 "${COLLECT_PID}" >/dev/null 2>&1; then
+                  kill "${COLLECT_PID}" >/dev/null 2>&1 || true
+                  wait "${COLLECT_PID}" >/dev/null 2>&1 || true
+                fi
+                if [ -n "${SERVER_PID:-}" ]; then
+                  kill "${SERVER_PID}" >/dev/null 2>&1 || true
+                fi
+                if [ "${OPENSANDBOX_CLEANUP_ON_EXIT:-1}" = "1" ]; then
+                  CLEANUP_ARGS=(
+                    cleanup
+                    --run-id "${RUN_ID}"
+                    --namespace "${OPENSANDBOX_NAMESPACE:-opensandbox}"
+                    --pool-names-file "${POOL_NAMES_FILE}"
+                  )
+                  if [ "${OPENSANDBOX_KEEP_POOLS:-0}" = "1" ]; then
+                    CLEANUP_ARGS+=(--keep-pools)
+                  fi
+                  "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/manage_opensandbox_job_resources.py" \
+                    "${CLEANUP_ARGS[@]}" \
+                    >>"${LOG_DIR}/opensandbox_cleanup.log" 2>&1 || true
+                fi
+                exit "${rc}"
+              }
+              terminate_job() {
+                exit 143
+              }
+              trap cleanup_job EXIT
+              trap terminate_job TERM INT
+
+              WANDB_RUN_ID="$(python3 -c 'import hashlib, os; print(hashlib.sha1(os.environ["NEMO_RL_SANDBOX_OBSERVABILITY_RUN_ID"].encode()).hexdigest()[:16])')"
+              export WANDB_RUN_ID
+              export WANDB_RESUME="${WANDB_RESUME:-allow}"
+              if [ "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB}" = "1" ]; then
+                "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/start_wandb_observability_run.py" \
+                  --benchmark swebench-verified \
+                  --harness harbor-mini-swe-agent \
+                  | tee "${RUN_DIR}/wandb_start.json"
+              fi
+              if [ "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB}" = "1" ] && [ "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_LIVE_METRICS}" = "1" ]; then
+                "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/stream_wandb_observability_metrics.py" \
+                  "${OBSERVABILITY_DIR}" \
+                  --rollouts "${OUTPUT}" \
+                  --benchmark swebench-verified \
+                  --harness harbor-mini-swe-agent \
+                  --target-rows "${TARGET_ROWS}" \
+                  --interval-s "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_LIVE_INTERVAL_S}" \
+                  --pool-agent-name harbor_agent \
+                  --latest-output "${RUN_DIR}/wandb_live_metrics_latest.json" \
+                  >"${LOG_DIR}/wandb_live_metrics.log" 2>&1 &
+                METRICS_PID=$!
+              fi
+              if [ "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB}" = "1" ] \
+                && [ "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_LIVE_METRICS}" = "1" ] \
+                && [ "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_SWE_TIMING}" = "1" ]; then
+                "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/stream_wandb_swe_timing_metrics.py" \
+                  "${OUTPUT}" \
+                  --target-rows "${TARGET_ROWS}" \
+                  --interval-s "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_LIVE_INTERVAL_S}" \
+                  --latest-output "${RUN_DIR}/wandb_swe_timing_metrics_latest.json" \
+                  --wandb-project "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_PROJECT}" \
+                  --wandb-run-id "${WANDB_RUN_ID}" \
+                  --wandb-run-name "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_RUN_NAME}" \
+                  --wandb-dir "${WANDB_DIR}" \
+                  --vllm-label-selector "${NEMO_RL_SANDBOX_OBSERVABILITY_VLLM_LABEL_SELECTOR}" \
+                  >"${LOG_DIR}/wandb_swe_timing_metrics.log" 2>&1 &
+                TIMING_METRICS_PID=$!
+              fi
+              if [ "${OPENSANDBOX_GENERATE_HARBOR_TASK_POOLS:-0}" = "1" ]; then
+                if [ -z "${OPENSANDBOX_GENERATED_POOL_PREFIX:-}" ]; then
+                  POOL_TEMPLATE_SUFFIX="-{task_name}-pool"
+                  if [[ "${OPENSANDBOX_POOL_REF_TEMPLATE:-}" == *"${POOL_TEMPLATE_SUFFIX}" ]]; then
+                    OPENSANDBOX_GENERATED_POOL_PREFIX="${OPENSANDBOX_POOL_REF_TEMPLATE%"${POOL_TEMPLATE_SUFFIX}"}"
+                  else
+                    OPENSANDBOX_GENERATED_POOL_PREFIX="swefastghcr"
+                  fi
+                fi
+                GENERATED_POOL_MANIFEST="${RUN_DIR}/generated_harbor_task_pools.yaml"
+                GENERATED_POOL_REPORT="${RUN_DIR}/generated_harbor_task_pools.report.json"
+                GENERATED_POOL_ARGS=(
+                  --tasks-dir "${TASKS_DIR}"
+                  --output "${GENERATED_POOL_MANIFEST}"
+                  --report-output "${GENERATED_POOL_REPORT}"
+                  --benchmark-label swebench-verified
+                  --pool-prefix "${OPENSANDBOX_GENERATED_POOL_PREFIX}"
+                  --max-tasks "${OPENSANDBOX_GENERATE_POOL_MAX_TASKS:-${TASK_LIMIT}}"
+                  --arch "${OPENSANDBOX_GENERATE_POOL_ARCH:-amd64}"
+                  --override-cpu "${OPENSANDBOX_GENERATE_POOL_CPU:-2}"
+                  --override-memory "${OPENSANDBOX_GENERATE_POOL_MEMORY:-8Gi}"
+                  --override-storage "${OPENSANDBOX_GENERATE_POOL_STORAGE:-20Gi}"
+                  --limit-cpu "${OPENSANDBOX_GENERATE_POOL_LIMIT_CPU:-4}"
+                  --limit-memory "${OPENSANDBOX_GENERATE_POOL_LIMIT_MEMORY:-12Gi}"
+                  --limit-storage "${OPENSANDBOX_GENERATE_POOL_LIMIT_STORAGE:-40Gi}"
+                  --pool-min "${OPENSANDBOX_GENERATE_POOL_MIN:-1}"
+                  --buffer-min "${OPENSANDBOX_GENERATE_POOL_BUFFER_MIN:-0}"
+                  --buffer-max "${OPENSANDBOX_GENERATE_POOL_BUFFER_MAX:-1}"
+                  --pool-max "${OPENSANDBOX_GENERATE_POOL_MAX:-1}"
+                  --execd-image "${OPENSANDBOX_EXECD_IMAGE:-mirror.gcr.io/opensandbox/execd:v1.0.15}"
+                )
+                if [ "${OPENSANDBOX_GENERATE_POOL_SWEBENCH_EPOCH_GHCR:-1}" = "1" ]; then
+                  GENERATED_POOL_ARGS+=(--swebench-epoch-ghcr)
+                fi
+                if [ "${OPENSANDBOX_GENERATE_POOL_MINI_SWE_AGENT_INIT_INSTALL:-0}" = "1" ]; then
+                  GENERATED_MINI_SWE_AGENT_PACKAGE="${OPENSANDBOX_GENERATE_POOL_MINI_SWE_AGENT_PACKAGE:-${MINI_SWE_AGENT_PACKAGE:-mini-swe-agent==${MINI_SWE_AGENT_VERSION:-2.1.0}}}"
+                  GENERATED_POOL_ARGS+=(
+                    --mini-swe-agent-init-install
+                    --mini-swe-agent-package "${GENERATED_MINI_SWE_AGENT_PACKAGE}"
+                  )
+                fi
+                "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/generate_harbor_task_pools.py" \
+                  "${GENERATED_POOL_ARGS[@]}" \
+                  | tee "${RUN_DIR}/generated_harbor_task_pools.log"
+                OPENSANDBOX_POOL_MANIFESTS="${OPENSANDBOX_POOL_MANIFESTS:+${OPENSANDBOX_POOL_MANIFESTS} }${GENERATED_POOL_MANIFEST}"
+                export OPENSANDBOX_POOL_MANIFESTS
+              fi
+              : >"${POOL_NAMES_FILE}"
+              if [ -n "${OPENSANDBOX_POOL_MANIFESTS:-}" ]; then
+                POOL_SCALE_FOR_CONCURRENCY_DEFAULT=1
+                POOL_WAIT_AVAILABLE_DEFAULT="${CONCURRENCY}"
+                if [ -n "${OPENSANDBOX_POOL_REF_TEMPLATE:-}" ]; then
+                  POOL_SCALE_FOR_CONCURRENCY_DEFAULT=0
+                  POOL_WAIT_AVAILABLE_DEFAULT=1
+                  if [ -n "${OPENSANDBOX_POOL_SCALE_PER_POOL:-}" ]; then
+                    POOL_WAIT_AVAILABLE_DEFAULT="${OPENSANDBOX_POOL_SCALE_PER_POOL}"
+                  fi
+                fi
+                for pool_manifest in ${OPENSANDBOX_POOL_MANIFESTS}; do
+                  POOL_SCALE_ARGS=()
+                  if [ -n "${OPENSANDBOX_POOL_SCALE_PER_POOL:-}" ]; then
+                    POOL_SCALE_ARGS+=(--scale-for-concurrency "${OPENSANDBOX_POOL_SCALE_PER_POOL}")
+                  elif [ "${OPENSANDBOX_POOL_SCALE_FOR_CONCURRENCY:-${POOL_SCALE_FOR_CONCURRENCY_DEFAULT}}" = "1" ]; then
+                    POOL_SCALE_ARGS+=(--scale-for-concurrency "${CONCURRENCY}")
+                  fi
+                  if [ "${#POOL_SCALE_ARGS[@]}" -gt 0 ]; then
+                    POOL_SCALE_ARGS+=(
+                      --scale-buffer-extra "${OPENSANDBOX_POOL_SCALE_BUFFER_EXTRA:-0}"
+                      --scale-pool-max-extra "${OPENSANDBOX_POOL_SCALE_POOL_MAX_EXTRA:-0}"
+                    )
+                    if [ "${OPENSANDBOX_POOL_PRESERVE_EXISTING_ALLOCATED:-1}" = "1" ]; then
+                      POOL_SCALE_ARGS+=(--preserve-existing-allocated)
+                    fi
+                  fi
+                  "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/manage_opensandbox_job_resources.py" \
+                    ensure-pool \
+                    --manifest "${pool_manifest}" \
+                    "${POOL_SCALE_ARGS[@]}" \
+                    "${POOL_FILTER_ARGS[@]}" \
+                    --wait-available "${OPENSANDBOX_POOL_WAIT_AVAILABLE:-${POOL_WAIT_AVAILABLE_DEFAULT}}" \
+                    --timeout-s "${OPENSANDBOX_POOL_WAIT_TIMEOUT_S:-900}" \
+                    --concurrency "${OPENSANDBOX_POOL_MANAGE_CONCURRENCY:-64}" \
+                    --names-out "${POOL_NAMES_FILE}" \
+                    | tee -a "${RUN_DIR}/opensandbox_pools.log"
+                done
+              fi
+              MODEL_CONFIG_PATH=responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+              HARBOR_CONFIG_PATH=responses_api_agents/harbor_agent/configs/harbor_agent_opensandbox_swebench_mini.yaml
+              CONFIG_PATHS="${MODEL_CONFIG_PATH},${HARBOR_CONFIG_PATH}"
+              DIRECT_MODEL_BASE_URL="${DIRECT_MODEL_BASE_URL:-${POLICY_BASE_URL:-http://vllm.default.svc.cluster.local:8000/v1}}"
+              DIRECT_API_KEY="${POLICY_API_KEY:-dummy}"
+              if [ "${EVAL_SKIP_POLICY_PROXY:-0}" = "1" ]; then
+                DIRECT_CONFIG_PATH="${RUN_DIR}/harbor_direct_eval.yaml"
+                cat > "${DIRECT_CONFIG_PATH}" <<EOF
+              harbor_agent:
+                responses_api_agents:
+                  harbor_agent:
+                    direct_model_base_url: ${DIRECT_MODEL_BASE_URL}
+                    model_server: null
+                    harbor_policy_proxy: null
+                    harbor_agent_env:
+                      MSWEA_API_KEY: ${DIRECT_API_KEY}
+                      OPENAI_API_KEY: ${DIRECT_API_KEY}
+                      OPENAI_BASE_URL: ${DIRECT_MODEL_BASE_URL}
+                      OPENAI_API_BASE: ${DIRECT_MODEL_BASE_URL}
+              EOF
+                CONFIG_PATHS="${HARBOR_CONFIG_PATH},${DIRECT_CONFIG_PATH}"
+              fi
+              EXPECTED_SERVER_COUNT="${NEMO_GYM_EXPECTED_SERVER_COUNT:-2}"
+              if [ "${EVAL_SKIP_POLICY_PROXY:-0}" = "1" ]; then
+                EXPECTED_SERVER_COUNT="${NEMO_GYM_EXPECTED_SERVER_COUNT:-1}"
+              fi
+              SERVER_READY_PATTERN="All ${EXPECTED_SERVER_COUNT} / ${EXPECTED_SERVER_COUNT} servers ready"
+              MINI_SWE_AGENT_VERSION="${MINI_SWE_AGENT_VERSION-2.1.0}"
+              if [ -n "${MINI_SWE_AGENT_PACKAGE:-}" ]; then
+                MINI_SWE_AGENT_INSTALL_PACKAGE="${MINI_SWE_AGENT_PACKAGE}"
+              elif [ -n "${MINI_SWE_AGENT_VERSION}" ]; then
+                MINI_SWE_AGENT_INSTALL_PACKAGE="mini-swe-agent==${MINI_SWE_AGENT_VERSION}"
+              else
+                MINI_SWE_AGENT_INSTALL_PACKAGE="mini-swe-agent"
+              fi
+              MINI_SWE_CONFIG_PATH="${RUN_DIR}/mini_swe_agent_responses_swebench.yaml"
+              export MINI_SWE_CONFIG_SOURCE="${GYM_DIR}/responses_api_agents/harbor_agent/configs/mini_swe_agent_responses_swebench.yaml"
+              export MINI_SWE_CONFIG_PATH
+              export MINI_SWE_CONFIG_TEMPERATURE="${MINI_SWE_CONFIG_TEMPERATURE-${GENERATION_TEMPERATURE-0.0}}"
+              export MINI_SWE_CONFIG_TOP_P="${MINI_SWE_CONFIG_TOP_P-${GENERATION_TOP_P-null}}"
+              export MINI_SWE_CONFIG_TOP_K="${MINI_SWE_CONFIG_TOP_K-${GENERATION_TOP_K-null}}"
+              export MINI_SWE_CONFIG_ENABLE_THINKING="${MINI_SWE_CONFIG_ENABLE_THINKING-${GENERATION_ENABLE_THINKING-true}}"
+              export MINI_SWE_CONFIG_DROP_PARAMS="${MINI_SWE_CONFIG_DROP_PARAMS-true}"
+              export MINI_SWE_CONFIG_PARALLEL_TOOL_CALLS="${MINI_SWE_CONFIG_PARALLEL_TOOL_CALLS-true}"
+              export MINI_SWE_CONFIG_STEP_LIMIT="${MINI_SWE_CONFIG_STEP_LIMIT:-}"
+              "${UV_RUN[@]}" python - <<'PY'
+              import os
+              from pathlib import Path
+
+              import yaml
+
+              def env_bool(name: str) -> bool | None:
+                  value = os.environ.get(name)
+                  if value in (None, "", "null", "None"):
+                      return None
+                  return value.lower() in ("1", "true", "yes", "on")
+
+              def env_float(name: str) -> float | None:
+                  value = os.environ.get(name)
+                  if value in (None, "", "null", "None"):
+                      return None
+                  return float(value)
+
+              def env_int(name: str) -> int | None:
+                  value = os.environ.get(name)
+                  if value in (None, "", "null", "None"):
+                      return None
+                  return int(value)
+
+              config = yaml.safe_load(Path(os.environ["MINI_SWE_CONFIG_SOURCE"]).read_text())
+              model_kwargs = config.setdefault("model", {}).setdefault("model_kwargs", {})
+              for key, value in (
+                  ("temperature", env_float("MINI_SWE_CONFIG_TEMPERATURE")),
+                  ("top_p", env_float("MINI_SWE_CONFIG_TOP_P")),
+              ):
+                  if value is None:
+                      model_kwargs.pop(key, None)
+                  else:
+                      model_kwargs[key] = value
+              extra_body = model_kwargs.setdefault("extra_body", {})
+              top_k = env_int("MINI_SWE_CONFIG_TOP_K")
+              if top_k is None:
+                  extra_body.pop("top_k", None)
+              else:
+                  extra_body["top_k"] = top_k
+              enable_thinking = env_bool("MINI_SWE_CONFIG_ENABLE_THINKING")
+              chat_template_kwargs = extra_body.setdefault("chat_template_kwargs", {})
+              if enable_thinking is None:
+                  chat_template_kwargs.pop("enable_thinking", None)
+              else:
+                  chat_template_kwargs["enable_thinking"] = enable_thinking
+              if not chat_template_kwargs:
+                  extra_body.pop("chat_template_kwargs", None)
+              for key, env_name in (
+                  ("drop_params", "MINI_SWE_CONFIG_DROP_PARAMS"),
+                  ("parallel_tool_calls", "MINI_SWE_CONFIG_PARALLEL_TOOL_CALLS"),
+              ):
+                  value = env_bool(env_name)
+                  if value is None:
+                      model_kwargs.pop(key, None)
+                  else:
+                      model_kwargs[key] = value
+              step_limit = env_int("MINI_SWE_CONFIG_STEP_LIMIT")
+              if step_limit is not None:
+                  config.setdefault("agent", {})["step_limit"] = step_limit
+              Path(os.environ["MINI_SWE_CONFIG_PATH"]).write_text(
+                  yaml.safe_dump(config, sort_keys=False)
+              )
+              PY
+              MINI_SWE_PREINSTALL_SCRIPT="${RUN_DIR}/mini_swe_preinstall.sh"
+              cat > "${MINI_SWE_PREINSTALL_SCRIPT}" <<EOF
+              set -e
+              EXPECTED_MINI_SWE_AGENT_VERSION="${MINI_SWE_AGENT_VERSION}"
+              MINI_SWE_AGENT_INSTALL_PACKAGE="${MINI_SWE_AGENT_INSTALL_PACKAGE}"
+              . "\$HOME/.local/bin/env" 2>/dev/null || true
+              if command -v mini-swe-agent >/dev/null 2>&1 && mini-swe-agent --help >/dev/null 2>&1; then
+                installed_version="\$(uv tool list 2>/dev/null | awk '/^mini-swe-agent / {print \$2; exit}' | sed 's/^v//')"
+                if [ -z "\${EXPECTED_MINI_SWE_AGENT_VERSION}" ] || [ "\${installed_version}" = "\${EXPECTED_MINI_SWE_AGENT_VERSION}" ]; then
+                  exit 0
+                fi
+              fi
+              needs_packages=0
+              for binary in curl git; do
+                if ! command -v "\${binary}" >/dev/null 2>&1; then
+                  needs_packages=1
+                fi
+              done
+              if [ "\${needs_packages}" = "1" ]; then
+                if command -v apt-get >/dev/null 2>&1; then
+                  apt_lock_timeout="\${APT_LOCK_TIMEOUT_S:-300}"
+                  run_apt() {
+                    for attempt in 1 2 3; do
+                      if DEBIAN_FRONTEND=noninteractive apt-get \
+                        -o "DPkg::Lock::Timeout=\${apt_lock_timeout}" \
+                        -o "APT::Get::Lock-Timeout=\${apt_lock_timeout}" \
+                        "\$@"; then
+                        return 0
+                      fi
+                      sleep "\$((attempt * 10))"
+                    done
+                    DEBIAN_FRONTEND=noninteractive apt-get \
+                      -o "DPkg::Lock::Timeout=\${apt_lock_timeout}" \
+                      -o "APT::Get::Lock-Timeout=\${apt_lock_timeout}" \
+                      "\$@"
+                  }
+                  run_apt update
+                  run_apt install -y curl build-essential git
+                elif command -v apk >/dev/null 2>&1; then
+                  apk add --no-cache curl bash build-base git python3 py3-pip
+                elif command -v yum >/dev/null 2>&1; then
+                  yum install -y curl git gcc make
+                elif command -v dnf >/dev/null 2>&1; then
+                  dnf install -y curl git gcc make
+                else
+                  echo "Warning: no known package manager found, assuming curl/git are available" >&2
+                fi
+              fi
+              if ! command -v curl >/dev/null 2>&1; then
+                echo "curl is required to install uv for mini-swe-agent" >&2
+                exit 1
+              fi
+              if ! command -v uv >/dev/null 2>&1; then
+                curl -LsSf https://astral.sh/uv/0.7.13/install.sh | sh
+              fi
+              . "\$HOME/.local/bin/env"
+              uv tool install "\${MINI_SWE_AGENT_INSTALL_PACKAGE}"
+              ln -sf "\$HOME/.local/bin/mini-swe-agent" /usr/local/bin/mini-swe-agent
+              mini-swe-agent --help
+              EOF
+              MINI_SWE_PREINSTALL_B64="$(base64 < "${MINI_SWE_PREINSTALL_SCRIPT}" | tr -d '\n')"
+              MINI_SWE_PREINSTALL_COMMAND="printf %s ${MINI_SWE_PREINSTALL_B64} | base64 -d >/tmp/nemo-mini-swe-preinstall.sh && bash /tmp/nemo-mini-swe-preinstall.sh"
+              if [ "${MINI_SWE_AGENT_PREINSTALL:-1}" = "1" ]; then
+                MINI_SWE_PRE_AGENT_SETUP_OVERRIDE="+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.pre_agent_setup_commands=[\"${MINI_SWE_PREINSTALL_COMMAND}\"]"
+              else
+                MINI_SWE_PRE_AGENT_SETUP_OVERRIDE="+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.pre_agent_setup_commands=[]"
+              fi
+              RESPONSE_OUTPUT_MODE="${HARBOR_RESPONSE_OUTPUT_MODE:-policy_trace}"
+              POLICY_PROXY_CONFIG=()
+              if [ "${EVAL_SKIP_POLICY_PROXY:-0}" = "1" ]; then
+                RESPONSE_OUTPUT_MODE="${HARBOR_RESPONSE_OUTPUT_MODE:-trajectory}"
+              else
+                POLICY_PROXY_CONFIG=(
+                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.responses_upstream_api=${POLICY_PROXY_RESPONSES_UPSTREAM_API:-responses}"
+                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.generation_temperature=${POLICY_PROXY_GENERATION_TEMPERATURE-${GENERATION_TEMPERATURE-0.0}}"
+                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.generation_top_p=${POLICY_PROXY_GENERATION_TOP_P-${GENERATION_TOP_P-null}}"
+                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.generation_top_k=${POLICY_PROXY_GENERATION_TOP_K-${GENERATION_TOP_K-null}}"
+                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.generation_chat_template_kwargs.enable_thinking=${POLICY_PROXY_GENERATION_ENABLE_THINKING-${GENERATION_ENABLE_THINKING-true}}"
+                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.force_generation_params=${POLICY_PROXY_FORCE_GENERATION_PARAMS:-true}"
+                )
+              fi
+              COMMON_CONFIG=(
+                "+config_paths=[${CONFIG_PATHS}]"
+                "++policy_base_url=${POLICY_BASE_URL:-http://vllm.default.svc.cluster.local:8000/v1}"
+                "++policy_api_key=${POLICY_API_KEY:-dummy}"
+                "++policy_model_name=${POLICY_MODEL_NAME:-Qwen/Qwen3.5-27B}"
+                "++nemo_gym_log_dir=${LOG_DIR}"
+                "++uv_cache_dir=${UV_CACHE_DIR}"
+                "++uv_venv_dir=${VENV_DIR}"
+                "++skip_venv_if_present=${NEMO_GYM_SKIP_VENV_IF_PRESENT:-true}"
+                "++ray_enabled=${NEMO_GYM_RAY_ENABLED:-false}"
+                "++default_host=127.0.0.1"
+                "++port_range_low=15001"
+                "++port_range_high=20000"
+                "+harbor_agent.responses_api_agents.harbor_agent.concurrency=${CONCURRENCY}"
+                "+harbor_agent.responses_api_agents.harbor_agent.runner_backend=async"
+                "+harbor_agent.responses_api_agents.harbor_agent.response_output_mode=${RESPONSE_OUTPUT_MODE}"
+                "+harbor_agent.responses_api_agents.harbor_agent.runner_num_cpus=0.0"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_agent_import_path=nemo_gym.sandbox.integrations.harbor_agents:CachedMiniSweAgent"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_agent_override_timeout=${HARBOR_AGENT_OVERRIDE_TIMEOUT:-null}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_agent_override_setup_timeout=1800"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_run_timeout=${HARBOR_RUN_TIMEOUT:-3900}"
+                "++harbor_agent.responses_api_agents.harbor_agent.harbor_agent_kwargs.version=${MINI_SWE_AGENT_VERSION:-null}"
+                "++harbor_agent.responses_api_agents.harbor_agent.harbor_agent_kwargs.config_file=${MINI_SWE_CONFIG_PATH}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_verifier_override_timeout=${HARBOR_VERIFIER_OVERRIDE_TIMEOUT:-null}"
+                "${POLICY_PROXY_CONFIG[@]}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batch_create_concurrency=${CREATE_CONCURRENCY}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batch_mode=${OPENSANDBOX_BATCH_MODE:-sdk}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batch_create_progress_timeout_s=300"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.sdk_max_connections=${SDK_MAX_CONNECTIONS}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.sdk_max_keepalive_connections=${SDK_MAX_KEEPALIVE_CONNECTIONS}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batchsandbox_ready_timeout_s=${OPENSANDBOX_BATCHSANDBOX_READY_TIMEOUT_S:-300}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batchsandbox_progress_timeout_s=${OPENSANDBOX_BATCHSANDBOX_PROGRESS_TIMEOUT_S:-120}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batchsandbox_endpoint_only_ready_after_s=${OPENSANDBOX_BATCHSANDBOX_ENDPOINT_ONLY_READY_AFTER_S:-5}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batchsandbox_poll_interval_s=${OPENSANDBOX_BATCHSANDBOX_POLL_INTERVAL_S:-0.1}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.create_probe_command='${OPENSANDBOX_CREATE_PROBE_COMMAND:-true}'"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.create_probe_expected_stdout=${OPENSANDBOX_CREATE_PROBE_EXPECTED_STDOUT:-null}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.create_probe_timeout_s=${OPENSANDBOX_CREATE_PROBE_TIMEOUT_S:-30}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.create_probe_sample_count=${OPENSANDBOX_CREATE_PROBE_SAMPLE_COUNT:-null}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.start_probe_command='${OPENSANDBOX_START_PROBE_COMMAND:-true}'"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.start_probe_expected_stdout=${OPENSANDBOX_START_PROBE_EXPECTED_STDOUT:-null}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.start_probe_timeout_s=${OPENSANDBOX_START_PROBE_TIMEOUT_S:-30}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.upload_environment_dir=${HARBOR_UPLOAD_ENVIRONMENT_DIR:-false}"
+                "${MINI_SWE_PRE_AGENT_SETUP_OVERRIDE}"
+                "++harbor_agent.responses_api_agents.harbor_agent.sandbox_pool.enabled=${GYM_SANDBOX_POOL_ENABLED:-false}"
+                "++harbor_agent.responses_api_agents.harbor_agent.sandbox_pool.acquire_policy=${GYM_SANDBOX_POOL_ACQUIRE_POLICY:-direct_create}"
+                "++harbor_agent.responses_api_agents.harbor_agent.sandbox_pool.verify_preallocated_handle=${GYM_SANDBOX_POOL_VERIFY_PREALLOCATED_HANDLE:-false}"
+                "++harbor_agent.responses_api_agents.harbor_agent.sandbox_pool.fallback_create_for_preallocated_handle=${GYM_SANDBOX_POOL_FALLBACK_CREATE_FOR_PREALLOCATED_HANDLE:-true}"
+                "++harbor_agent.responses_api_agents.harbor_agent.sandbox_pool.prewarm_environment_setup=${GYM_SANDBOX_POOL_PREWARM_ENVIRONMENT_SETUP:-false}"
+                "++harbor_agent.responses_api_agents.harbor_agent.sandbox_pool.prewarm_policy_proxy=${GYM_SANDBOX_POOL_PREWARM_POLICY_PROXY:-false}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batch_create_retries=10"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batch_create_retry_delay_s=2.0"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batch_create_retry_max_delay_s=90.0"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.operation_retries=5"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.operation_retry_delay_s=1.0"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.operation_retry_max_delay_s=30.0"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.create_request_timeout_s=300"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.create_timeout_s=600"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.request_timeout_s=300"
+                "++harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.spec.timeout_s=7200"
+                "++harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.spec.resources.cpu=500m"
+                "++harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.spec.resources.memory=4Gi"
+                "++harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.spec.resources.ephemeral-storage=4Gi"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.spec.metadata.run_family=gym-harbor-mini-swe-eval-full"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.spec.metadata.run_id=${RUN_ID}"
+              )
+              POOL_CONFIG=()
+              if [ -n "${OPENSANDBOX_POOL_REF:-}" ]; then
+                POOL_CONFIG=(
+                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.spec.extensions.poolRef=${OPENSANDBOX_POOL_REF}"
+                  "++harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.spec.platform=null"
+                )
+              elif [ -n "${OPENSANDBOX_POOL_REF_TEMPLATE:-}" ]; then
+                POOL_CONFIG=(
+                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.pool_ref_template='${OPENSANDBOX_POOL_REF_TEMPLATE}'"
+                  "++harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.spec.platform=null"
+                )
+              fi
+
+              "${UV_RUN[@]}" ng_run "${COMMON_CONFIG[@]}" "${POOL_CONFIG[@]}" >"${LOG_DIR}/ng_run.log" 2>&1 &
+              SERVER_PID=$!
+              for _ in $(seq 1 120); do
+                if grep -q "${SERVER_READY_PATTERN}" "${LOG_DIR}/ng_run.log"; then
+                  break
+                fi
+                if ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
+                  tail -n 200 "${LOG_DIR}/ng_run.log"
+                  exit 1
+                fi
+                sleep 5
+              done
+              if ! grep -q "${SERVER_READY_PATTERN}" "${LOG_DIR}/ng_run.log"; then
+                tail -n 200 "${LOG_DIR}/ng_run.log"
+                exit 1
+              fi
+
+              if [ "${GYM_SANDBOX_POOL_ENABLED:-0}" = "1" ]; then
+                PREWARM_ARGS=(
+                  prewarm \
+                  --agent-name harbor_agent \
+                  --input-jsonl "${INPUT}" \
+                  --limit "${TARGET_ROWS}" \
+                  --num-repeats "${GYM_SANDBOX_POOL_NUM_REPEATS:-1}" \
+                  --concurrency "${GYM_SANDBOX_POOL_PREWARM_CONCURRENCY:-${CREATE_CONCURRENCY}}" \
+                  --create-concurrency "${GYM_SANDBOX_POOL_PREWARM_CREATE_CONCURRENCY:-${GYM_SANDBOX_POOL_PREWARM_CONCURRENCY:-${CREATE_CONCURRENCY}}}" \
+                  --prepare-concurrency "${GYM_SANDBOX_POOL_PREWARM_PREPARE_CONCURRENCY:-${GYM_SANDBOX_POOL_PREWARM_CONCURRENCY:-${CREATE_CONCURRENCY}}}" \
+                  --retries "${GYM_SANDBOX_POOL_PREWARM_RETRIES:-3}" \
+                  --retry-delay-s "${GYM_SANDBOX_POOL_PREWARM_RETRY_DELAY_S:-10}" \
+                  --retry-backoff "${GYM_SANDBOX_POOL_PREWARM_RETRY_BACKOFF:-2}" \
+                  --retry-max-delay-s "${GYM_SANDBOX_POOL_PREWARM_RETRY_MAX_DELAY_S:-60}" \
+                  --replace-existing
+                )
+                if [ "${GYM_SANDBOX_POOL_PREWARM_ENVIRONMENT_SETUP:-0}" = "1" ]; then
+                  PREWARM_ARGS+=(--prepare-environment)
+                fi
+                if [ "${GYM_SANDBOX_POOL_PREWARM_POLICY_PROXY:-0}" = "1" ]; then
+                  PREWARM_ARGS+=(--start-policy-proxy)
+                fi
+                "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/prewarm_gym_harbor_sandboxes.py" \
+                  "${PREWARM_ARGS[@]}" \
+                  | tee "${RUN_DIR}/sandbox_prewarm.json"
+              fi
+              if [ "${PREWARM_ONLY:-0}" = "1" ]; then
+                stop_live_metrics
+                "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/summarize_observability_metrics.py" \
+                  "${OBSERVABILITY_DIR}" \
+                  | tee "${RUN_DIR}/observability_metrics.json"
+                echo "prewarm_only=1"
+                echo "run_dir=${RUN_DIR}"
+                echo "logs=${LOG_DIR}"
+                echo "observability=${OBSERVABILITY_DIR}"
+                exit 0
+              fi
+
+              set +e
+              "${UV_RUN[@]}" ng_collect_rollouts \
+                "${COMMON_CONFIG[@]}" \
+                "${POOL_CONFIG[@]}" \
+                +agent_name=harbor_agent \
+                +input_jsonl_fpath="${INPUT}" \
+                +output_jsonl_fpath="${OUTPUT}" \
+                +limit="${TARGET_ROWS}" \
+                +num_samples_in_parallel="${CONCURRENCY}" \
+                +upload_rollouts_to_wandb=false \
+                "+responses_create_params={temperature: ${GENERATION_TEMPERATURE-0.0}, top_p: ${GENERATION_TOP_P-null}, max_output_tokens: ${GENERATION_MAX_OUTPUT_TOKENS:-49152}, metadata: {extra_body: \"{\\\"top_k\\\":${GENERATION_TOP_K-null},\\\"min_p\\\":0.0,\\\"presence_penalty\\\":0.0,\\\"repetition_penalty\\\":1.0}\", chat_template_kwargs: \"{\\\"enable_thinking\\\":${GENERATION_ENABLE_THINKING-true}}\"}}" \
+                >"${LOG_DIR}/ng_collect_rollouts.log" 2>&1 &
+              COLLECT_PID=$!
+              wait "${COLLECT_PID}"
+              COLLECT_RC=$?
+              COLLECT_PID=""
+              set -e
+              if [ "${COLLECT_RC}" -ne 0 ]; then
+                if [ -s "${OUTPUT}" ] && grep -q "/aggregate_metrics" "${LOG_DIR}/ng_collect_rollouts.log"; then
+                  echo "Ignoring post-write aggregate_metrics failure from ng_collect_rollouts"
+                else
+                  tail -n 200 "${LOG_DIR}/ng_collect_rollouts.log"
+                  exit "${COLLECT_RC}"
+                fi
+              fi
+              cleanup_prewarmed_sandboxes
+
+              "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/verify_gym_rollouts.py" \
+                "${OUTPUT}" \
+                --min-rows "${TARGET_ROWS}" \
+                | tee "${RUN_DIR}/verify.json"
+
+              "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/summarize_harbor_trajectory_timing.py" \
+                "${OUTPUT}" \
+                | tee "${RUN_DIR}/trajectory_timing_metrics.json"
+
+              "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/summarize_gym_rollouts.py" \
+                "${OUTPUT}" \
+                | tee "${RUN_DIR}/summary.json"
+
+              stop_live_metrics
+
+              "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/finalize_observability_artifacts.py" \
+                "${OBSERVABILITY_DIR}" \
+                --run-id "${RUN_ID}" \
+                --max-rendered-trajectories "${NEMO_RL_SANDBOX_OBSERVABILITY_MAX_RENDERED}" \
+                --wandb \
+                --wandb-project "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_PROJECT}" \
+                --wandb-run-name "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_RUN_NAME}" \
+                --wandb-artifact-name "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_ARTIFACT}" \
+                --wandb-max-time-series-points "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_MAX_TIME_SERIES_POINTS}" \
+                --wandb-max-table-rows "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_MAX_TABLE_ROWS}" \
+                --wandb-max-media-items "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_MAX_MEDIA_ITEMS}" \
+                | tee "${RUN_DIR}/finalize_observability.log"
+
+              "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/summarize_observability_metrics.py" \
+                "${OBSERVABILITY_DIR}" \
+                --rollouts "${OUTPUT}" \
+                | tee "${RUN_DIR}/observability_metrics.json"
+
+              echo "run_dir=${RUN_DIR}"
+              echo "input=${INPUT}"
+              echo "output=${OUTPUT}"
+              echo "logs=${LOG_DIR}"
+              echo "observability=${OBSERVABILITY_DIR}"
+          env:
+            - name: GYM_EVAL_WORKSPACE_ROOT
+              value: /mnt/rl-workspace/gym-eval
+            - name: GYM_DIR
+              value: /mnt/rl-workspace/gym/deps/Gym
+            - name: OPENSANDBOX_PYTHON_DIR
+              value: /mnt/rl-workspace/gym/deps/opensandbox-python
+            - name: HARBOR_DIR
+              value: /mnt/rl-workspace/gym/deps/harbor
+            - name: HARBOR_TASKS_DIR
+              value: /mnt/rl-workspace/gym-eval/data/harbor_swebench_verified_official
+            - name: POLICY_BASE_URL
+              value: http://vllm.default.svc.cluster.local:8000/v1
+            - name: POLICY_MODEL_NAME
+              value: Qwen/Qwen3.5-27B
+            - name: CONCURRENCY
+              value: "2"
+            - name: CREATE_CONCURRENCY
+              value: "2"
+            - name: SDK_MAX_CONNECTIONS
+              value: "64"
+            - name: SDK_MAX_KEEPALIVE_CONNECTIONS
+              value: "32"
+            - name: OPENSANDBOX_BATCH_MODE
+              value: batchsandbox
+            - name: OPENSANDBOX_GENERATE_HARBOR_TASK_POOLS
+              value: "0"
+            - name: OPENSANDBOX_GENERATED_POOL_PREFIX
+              value: swefastghcr
+            - name: OPENSANDBOX_GENERATE_POOL_MINI_SWE_AGENT_INIT_INSTALL
+              value: "0"
+            - name: OPENSANDBOX_POOL_MANIFESTS
+              value: ""
+            - name: OPENSANDBOX_POOL_REF_TEMPLATE
+              value: ""
+            - name: OPENSANDBOX_POOL_WAIT_TIMEOUT_S
+              value: "1800"
+            - name: OPENSANDBOX_POOL_MANAGE_CONCURRENCY
+              value: "32"
+            - name: OPENSANDBOX_POOL_SCALE_BUFFER_EXTRA
+              value: "0"
+            - name: OPENSANDBOX_POOL_SCALE_POOL_MAX_EXTRA
+              value: "0"
+            - name: OPENSANDBOX_POOL_PRESERVE_EXISTING_ALLOCATED
+              value: "1"
+            - name: OPENSANDBOX_KEEP_POOLS
+              value: "1"
+            - name: GYM_SANDBOX_POOL_ENABLED
+              value: "1"
+            - name: GYM_SANDBOX_POOL_ACQUIRE_POLICY
+              value: fail_fast
+            - name: GYM_SANDBOX_POOL_VERIFY_PREALLOCATED_HANDLE
+              value: "false"
+            - name: GYM_SANDBOX_POOL_FALLBACK_CREATE_FOR_PREALLOCATED_HANDLE
+              value: "false"
+            - name: GYM_SANDBOX_POOL_PREWARM_ENVIRONMENT_SETUP
+              value: "1"
+            - name: GYM_SANDBOX_POOL_PREWARM_POLICY_PROXY
+              value: "0"
+            - name: GYM_SANDBOX_POOL_PREWARM_CONCURRENCY
+              value: "2"
+            - name: GYM_SANDBOX_POOL_PREWARM_CREATE_CONCURRENCY
+              value: "2"
+            - name: GYM_SANDBOX_POOL_PREWARM_PREPARE_CONCURRENCY
+              value: "2"
+            - name: HARBOR_UPLOAD_ENVIRONMENT_DIR
+              value: "false"
+            - name: OPENSANDBOX_CREATE_PROBE_COMMAND
+              value: "true"
+            - name: OPENSANDBOX_CREATE_PROBE_TIMEOUT_S
+              value: "60"
+            - name: OPENSANDBOX_BATCHSANDBOX_READY_TIMEOUT_S
+              value: "600"
+            - name: OPENSANDBOX_BATCHSANDBOX_PROGRESS_TIMEOUT_S
+              value: "300"
+            - name: OPENSANDBOX_BATCHSANDBOX_ENDPOINT_ONLY_READY_AFTER_S
+              value: "5"
+            - name: OPENSANDBOX_START_PROBE_COMMAND
+              value: "true"
+            - name: MINI_SWE_AGENT_PREINSTALL
+              value: "1"
+            - name: TASK_LIMIT
+              value: "2"
+            - name: MINI_SWE_CONFIG_STEP_LIMIT
+              value: ""
+            - name: EVAL_SKIP_POLICY_PROXY
+              value: "1"
+            - name: HARBOR_RUN_TIMEOUT
+              value: "3900"
+            - name: GENERATION_TEMPERATURE
+              value: "0.6"
+            - name: GENERATION_TOP_P
+              value: "0.95"
+            - name: GENERATION_TOP_K
+              value: "20"
+            - name: GENERATION_MAX_OUTPUT_TOKENS
+              value: "49152"
+            - name: POLICY_PROXY_RESPONSES_UPSTREAM_API
+              value: responses
+            - name: NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_LIVE_INTERVAL_S
+              value: "15"
+            - name: NEMO_GYM_REBUILD_VENVS
+              value: "0"
+            - name: NEMO_GYM_SKIP_VENV_IF_PRESENT
+              value: "true"
+            - name: NEMO_GYM_UV_VENV_DIR
+              value: /mnt/rl-workspace/gym-eval/venvs/harbor-mini-swe-py312
+            - name: NEMO_GYM_RAY_ENABLED
+              value: "false"
+            - name: TASK_OFFSET
+              value: "0"
+            - name: TASK_STRIDE
+              value: "1"
+            - name: TASK_SAMPLE_SEED
+              value: ""
+            - name: OPENSANDBOX_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: opensandbox-api-key
+                  key: api-key
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: wandb-api-key
+                  key: WANDB_API_KEY
+                  optional: true
+            - name: EXCLUDE_ROLLOUTS
+              value: ""
+          resources:
+            requests:
+              cpu: "16"
+              memory: 64Gi
+            limits:
+              cpu: "32"
+              memory: 96Gi
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+      volumes:
+        - name: rl-workspace
+          persistentVolumeClaim:
+            claimName: rl-workspace

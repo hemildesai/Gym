@@ -1,0 +1,124 @@
+# Values for installing OpenSandbox on the NeMo-RL k8s cluster.
+
+opensandbox-controller:
+  controller:
+    replicaCount: 1
+    kubeClient:
+      # Keep disabled for the current controller image. The local chart renders
+      # kube-client flags when these are nonzero, but deployed controller
+      # v0.1.0 rejects those flags and crashloops.
+      qps: 0
+      burst: 0
+    snapshot:
+      imageCommitterImage: ""
+      commitJobTimeout: ""
+    resources:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+      limits:
+        cpu: "4"
+        memory: 8Gi
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: nodeGroup
+                  operator: In
+                  values: [customer-cpu]
+            - matchExpressions:
+                - key: karpenter.sh/nodepool
+                  operator: In
+                  values: [cpu]
+                - key: karpenter.k8s.aws/instance-generation
+                  operator: Gt
+                  values: ["5"]
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+                - key: nodeGroup
+                  operator: In
+                  values: [customer-cpu]
+
+opensandbox-server:
+  server:
+    # v0.1.13 fixes a Kubernetes create path event-loop block that can make
+    # the server fail health probes under bursty sandbox creation.
+    image:
+      repository: sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/server
+      tag: "v0.1.13"
+    replicaCount: 4
+    env:
+      - name: OPENSANDBOX_SERVER_API_KEY
+        valueFrom:
+          secretKeyRef:
+            name: opensandbox-api-key
+            key: api-key
+      # v0.1.12 blocks startup when server.api_key is empty in config.toml.
+      # Keep the key in a Kubernetes Secret rather than writing it into Helm
+      # values; this acknowledgement keeps the PoC server bootable.
+      - name: OPENSANDBOX_INSECURE_SERVER
+        value: "YES"
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: nodeGroup
+                  operator: In
+                  values: [customer-cpu]
+            - matchExpressions:
+                - key: karpenter.sh/nodepool
+                  operator: In
+                  values: [cpu]
+                - key: karpenter.k8s.aws/instance-generation
+                  operator: Gt
+                  values: ["5"]
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+                - key: nodeGroup
+                  operator: In
+                  values: [customer-cpu]
+    resources:
+      requests:
+        cpu: "2"
+        memory: 8Gi
+      limits:
+        cpu: "4"
+        memory: 16Gi
+
+  configToml: |
+    [server]
+    host = "0.0.0.0"
+    port = 80
+    api_key = ""
+
+    [log]
+    level = "INFO"
+
+    [runtime]
+    type = "kubernetes"
+    execd_image = "opensandbox/execd:v1.0.15"
+
+    [kubernetes]
+    kubeconfig_path = ""
+    namespace = "opensandbox"
+    informer_enabled = true
+    informer_resync_seconds = 300
+    informer_watch_timeout_seconds = 60
+    sandbox_create_timeout_seconds = 900
+    # Warm-pool allocations are usually ready before the next 1s poll. Keep the
+    # interval short so pooled eval startup reflects control-plane allocation
+    # rather than a fixed readiness polling tax.
+    sandbox_create_poll_interval_seconds = 0.1
+    workload_provider = "batchsandbox"
+    batchsandbox_template_file = "/etc/opensandbox/example.batchsandbox-template.yaml"
+    image_pull_policy = "IfNotPresent"
+
+    [egress]
+    image = "mirror.gcr.io/opensandbox/egress:v1.0.10"
+    mode = "dns+nft"

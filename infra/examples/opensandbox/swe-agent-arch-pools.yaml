@@ -1,0 +1,233 @@
+apiVersion: sandbox.opensandbox.io/v1alpha1
+kind: Pool
+metadata:
+  name: swe-agent-pool-arm64
+  namespace: opensandbox
+  labels:
+    app.kubernetes.io/name: opensandbox
+    app.kubernetes.io/component: swe-agent-pool
+    sandbox.nemo-gym/arch: arm64
+    kai.scheduler/queue: backfill
+spec:
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: opensandbox
+        app.kubernetes.io/component: swe-agent-sandbox
+        sandbox.nemo-gym/arch: arm64
+        kai.scheduler/queue: backfill
+    spec:
+      schedulerName: kai-scheduler
+      dnsPolicy: ClusterFirst
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nodeGroup
+                    operator: In
+                    values: [customer-cpu]
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: [arm64]
+              - matchExpressions:
+                  - key: karpenter.sh/nodepool
+                    operator: In
+                    values: [cpu]
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: [arm64]
+                  - key: karpenter.k8s.aws/instance-generation
+                    operator: Gt
+                    values: ["5"]
+                  - key: karpenter.k8s.aws/instance-category
+                    operator: In
+                    values: [c, m, r]
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: nodeGroup
+                    operator: In
+                    values: [customer-cpu]
+      volumes:
+        - name: sandbox-storage
+          emptyDir: {}
+        - name: opensandbox-bin
+          emptyDir: {}
+        - name: sandbox-logs
+          emptyDir: {}
+      initContainers:
+        - name: task-executor-installer
+          image: sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/task-executor:v0.1.0
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              cp /workspace/server /opt/opensandbox/bin/task-executor
+              chmod +x /opt/opensandbox/bin/task-executor
+          volumeMounts:
+            - name: opensandbox-bin
+              mountPath: /opt/opensandbox/bin
+        - name: execd-installer
+          image: opensandbox/execd:v1.0.15
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              cp ./execd /opt/opensandbox/bin/execd
+              cp ./bootstrap.sh /opt/opensandbox/bin/bootstrap.sh
+              chmod +x /opt/opensandbox/bin/execd
+              chmod +x /opt/opensandbox/bin/bootstrap.sh
+          volumeMounts:
+            - name: opensandbox-bin
+              mountPath: /opt/opensandbox/bin
+      containers:
+        - name: sandbox
+          image: astral/uv:python3.12-bookworm-slim
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              /opt/opensandbox/bin/task-executor -listen-addr=0.0.0.0:5758 >/tmp/task-executor.log 2>&1
+          env:
+            - name: SANDBOX_MAIN_CONTAINER
+              value: main
+            - name: EXECD_ENVS
+              value: /opt/opensandbox/.env
+            - name: EXECD
+              value: /opt/opensandbox/bin/execd
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: sandbox-storage
+              mountPath: /var/lib/sandbox
+            - name: opensandbox-bin
+              mountPath: /opt/opensandbox/bin
+            - name: sandbox-logs
+              mountPath: /workspace/logs
+  capacitySpec:
+    bufferMax: 64
+    bufferMin: 0
+    poolMax: 128
+    poolMin: 0
+---
+apiVersion: sandbox.opensandbox.io/v1alpha1
+kind: Pool
+metadata:
+  name: swe-agent-pool-amd64
+  namespace: opensandbox
+  labels:
+    app.kubernetes.io/name: opensandbox
+    app.kubernetes.io/component: swe-agent-pool
+    sandbox.nemo-gym/arch: amd64
+    kai.scheduler/queue: backfill
+spec:
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: opensandbox
+        app.kubernetes.io/component: swe-agent-sandbox
+        sandbox.nemo-gym/arch: amd64
+        kai.scheduler/queue: backfill
+    spec:
+      schedulerName: kai-scheduler
+      dnsPolicy: ClusterFirst
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nodeGroup
+                    operator: In
+                    values: [customer-cpu]
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: [amd64]
+              - matchExpressions:
+                  - key: karpenter.sh/nodepool
+                    operator: In
+                    values: [cpu]
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: [amd64]
+                  - key: karpenter.k8s.aws/instance-generation
+                    operator: Gt
+                    values: ["5"]
+                  - key: karpenter.k8s.aws/instance-category
+                    operator: In
+                    values: [c, m, r]
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: nodeGroup
+                    operator: In
+                    values: [customer-cpu]
+      volumes:
+        - name: sandbox-storage
+          emptyDir: {}
+        - name: opensandbox-bin
+          emptyDir: {}
+        - name: sandbox-logs
+          emptyDir: {}
+      initContainers:
+        - name: task-executor-installer
+          image: sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/task-executor:v0.1.0
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              cp /workspace/server /opt/opensandbox/bin/task-executor
+              chmod +x /opt/opensandbox/bin/task-executor
+          volumeMounts:
+            - name: opensandbox-bin
+              mountPath: /opt/opensandbox/bin
+        - name: execd-installer
+          image: opensandbox/execd:v1.0.15
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              cp ./execd /opt/opensandbox/bin/execd
+              cp ./bootstrap.sh /opt/opensandbox/bin/bootstrap.sh
+              chmod +x /opt/opensandbox/bin/execd
+              chmod +x /opt/opensandbox/bin/bootstrap.sh
+          volumeMounts:
+            - name: opensandbox-bin
+              mountPath: /opt/opensandbox/bin
+      containers:
+        - name: sandbox
+          image: astral/uv:python3.12-bookworm-slim
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              /opt/opensandbox/bin/task-executor -listen-addr=0.0.0.0:5758 >/tmp/task-executor.log 2>&1
+          env:
+            - name: SANDBOX_MAIN_CONTAINER
+              value: main
+            - name: EXECD_ENVS
+              value: /opt/opensandbox/.env
+            - name: EXECD
+              value: /opt/opensandbox/bin/execd
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: sandbox-storage
+              mountPath: /var/lib/sandbox
+            - name: opensandbox-bin
+              mountPath: /opt/opensandbox/bin
+            - name: sandbox-logs
+              mountPath: /workspace/logs
+  capacitySpec:
+    bufferMax: 64
+    bufferMin: 0
+    poolMax: 128
+    poolMin: 0

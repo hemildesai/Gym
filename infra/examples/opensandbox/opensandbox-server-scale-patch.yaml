@@ -1,0 +1,33 @@
+# Strategic merge patch for the live OpenSandbox server deployment before
+# running 512+ trajectory scale jobs:
+# kubectl patch deployment -n opensandbox-system opensandbox-server \
+#   --type strategic --patch-file infra/examples/opensandbox/opensandbox-server-scale-patch.yaml
+spec:
+  replicas: 4
+  template:
+    spec:
+      containers:
+        - name: main
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+            limits:
+              cpu: "4"
+              memory: 16Gi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
