@@ -8,11 +8,14 @@ Qwen3_5-27B:
       replace_developer_role_with_system: true
       debug: false
 
-      # Recommended in https://huggingface.co/Qwen/Qwen3.5-27B#using-qwen35-via-the-chat-completions-api
+      # Defaults from https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/generation_config.json
       extra_body:
-        temperature: 1.0
+        temperature: 0.6
         top_p: 0.95
+        top_k: 20
         max_output_tokens: null
+      chat_template_kwargs:
+        enable_thinking: true
 
       # For example, if your model is downloaded at ~/.cache/huggingface/hub/models--Qwen--Qwen3-235B-A22B-Instruct-2507, your hf_home here would be `~/.cache/huggingface`
       hf_home: null

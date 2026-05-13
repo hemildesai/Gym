@@ -424,8 +424,19 @@ spec:
                 local limit="$3"
                 local parallel="$4"
                 local log_fpath="$5"
+                local collect_timeout_s="${GYM_COLLECT_ROLLOUTS_TIMEOUT_S:-}"
+                local command_prefix=()
+                if [ -n "${collect_timeout_s}" ]; then
+                  if [[ ! "${collect_timeout_s}" =~ ^[0-9]+$ ]]; then
+                    echo "GYM_COLLECT_ROLLOUTS_TIMEOUT_S must be an integer number of seconds" >&2
+                    return 2
+                  fi
+                  if [ "${collect_timeout_s}" -gt 0 ]; then
+                    command_prefix=(timeout --kill-after=30s "${collect_timeout_s}")
+                  fi
+                fi
                 set +e
-                "${UV_RUN[@]}" ng_collect_rollouts \
+                "${command_prefix[@]}" "${UV_RUN[@]}" ng_collect_rollouts \
                   "${COMMON_CONFIG[@]}" \
                   "${POOL_CONFIG[@]}" \
                   +agent_name=harbor_agent \
@@ -600,9 +611,6 @@ spec:
                 )
                 if [ "${GYM_SANDBOX_POOL_PREWARM_ENVIRONMENT_SETUP:-0}" = "1" ]; then
                   PREWARM_ARGS+=(--prepare-environment)
-                fi
-                if [ "${GYM_SANDBOX_POOL_PREWARM_POLICY_PROXY:-0}" = "1" ]; then
-                  PREWARM_ARGS+=(--start-policy-proxy)
                 fi
                 local prewarm_rc=0
                 "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/prewarm_gym_harbor_sandboxes.py" \
@@ -856,32 +864,24 @@ spec:
                     | tee -a "${RUN_DIR}/opensandbox_pools.log"
                 done
               fi
-              MODEL_CONFIG_PATH=responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
               HARBOR_CONFIG_PATH="${HARBOR_CONFIG_PATH:-${DEFAULT_HARBOR_CONFIG_PATH}}"
-              CONFIG_PATHS="${MODEL_CONFIG_PATH},${HARBOR_CONFIG_PATH}"
               DIRECT_MODEL_BASE_URL="${DIRECT_MODEL_BASE_URL:-${POLICY_BASE_URL:-http://vllm.default.svc.cluster.local:8000/v1}}"
               DIRECT_API_KEY="${POLICY_API_KEY:-dummy}"
-              if [ "${EVAL_SKIP_POLICY_PROXY:-0}" = "1" ]; then
-                DIRECT_CONFIG_PATH="${RUN_DIR}/harbor_direct_eval.yaml"
-                cat > "${DIRECT_CONFIG_PATH}" <<EOF
+              DIRECT_CONFIG_PATH="${RUN_DIR}/harbor_direct_eval.yaml"
+              cat > "${DIRECT_CONFIG_PATH}" <<EOF
               harbor_agent:
                 responses_api_agents:
                   harbor_agent:
                     direct_model_base_url: ${DIRECT_MODEL_BASE_URL}
                     model_server: null
-                    harbor_policy_proxy: null
                     harbor_agent_env:
                       MSWEA_API_KEY: ${DIRECT_API_KEY}
                       OPENAI_API_KEY: ${DIRECT_API_KEY}
                       OPENAI_BASE_URL: ${DIRECT_MODEL_BASE_URL}
                       OPENAI_API_BASE: ${DIRECT_MODEL_BASE_URL}
               EOF
-                CONFIG_PATHS="${HARBOR_CONFIG_PATH},${DIRECT_CONFIG_PATH}"
-              fi
-              EXPECTED_SERVER_COUNT="${NEMO_GYM_EXPECTED_SERVER_COUNT:-2}"
-              if [ "${EVAL_SKIP_POLICY_PROXY:-0}" = "1" ]; then
-                EXPECTED_SERVER_COUNT="${NEMO_GYM_EXPECTED_SERVER_COUNT:-1}"
-              fi
+              CONFIG_PATHS="${HARBOR_CONFIG_PATH},${DIRECT_CONFIG_PATH}"
+              EXPECTED_SERVER_COUNT="${NEMO_GYM_EXPECTED_SERVER_COUNT:-1}"
               SERVER_READY_PATTERN="All ${EXPECTED_SERVER_COUNT} / ${EXPECTED_SERVER_COUNT} servers ready"
               MINI_SWE_AGENT_VERSION="${MINI_SWE_AGENT_VERSION-2.1.0}"
               if [ -n "${MINI_SWE_AGENT_PACKAGE:-}" ]; then
@@ -1045,20 +1045,7 @@ spec:
                   "+harbor_agent.responses_api_agents.harbor_agent.harbor_agent_import_path=responses_api_agents.harbor_agent.custom_agents.terminus_2_nemo_gym:Terminus2NemoGym"
                 )
               fi
-              RESPONSE_OUTPUT_MODE="${HARBOR_RESPONSE_OUTPUT_MODE:-policy_trace}"
-              POLICY_PROXY_CONFIG=()
-              if [ "${EVAL_SKIP_POLICY_PROXY:-0}" = "1" ]; then
-                RESPONSE_OUTPUT_MODE="${HARBOR_RESPONSE_OUTPUT_MODE:-trajectory}"
-              else
-                POLICY_PROXY_CONFIG=(
-                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.responses_upstream_api=${POLICY_PROXY_RESPONSES_UPSTREAM_API:-responses}"
-                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.generation_temperature=${POLICY_PROXY_GENERATION_TEMPERATURE:-${GENERATION_TEMPERATURE:-0.6}}"
-                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.generation_top_p=${POLICY_PROXY_GENERATION_TOP_P:-${GENERATION_TOP_P:-0.95}}"
-                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.generation_top_k=${POLICY_PROXY_GENERATION_TOP_K:-${GENERATION_TOP_K:-20}}"
-                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.generation_chat_template_kwargs.enable_thinking=${POLICY_PROXY_GENERATION_ENABLE_THINKING:-${GENERATION_ENABLE_THINKING:-true}}"
-                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.force_generation_params=${POLICY_PROXY_FORCE_GENERATION_PARAMS:-true}"
-                )
-              fi
+              RESPONSE_OUTPUT_MODE="${HARBOR_RESPONSE_OUTPUT_MODE:-trajectory}"
               COMMON_CONFIG=(
                 "+config_paths=[${CONFIG_PATHS}]"
                 "++policy_base_url=${POLICY_BASE_URL:-http://vllm.default.svc.cluster.local:8000/v1}"
@@ -1080,7 +1067,6 @@ spec:
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_agent_override_setup_timeout=1800"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_run_timeout=${HARBOR_RUN_TIMEOUT:-3900}"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_verifier_override_timeout=${HARBOR_VERIFIER_OVERRIDE_TIMEOUT:-null}"
-                "${POLICY_PROXY_CONFIG[@]}"
                 "${AGENT_OVERRIDE_CONFIG[@]}"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batch_create_concurrency=${CREATE_CONCURRENCY}"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batch_create_progress_timeout_s=${OPENSANDBOX_BATCH_CREATE_PROGRESS_TIMEOUT_S:-300}"
@@ -1101,7 +1087,6 @@ spec:
                 "++harbor_agent.responses_api_agents.harbor_agent.sandbox_pool.verify_preallocated_handle=${GYM_SANDBOX_POOL_VERIFY_PREALLOCATED_HANDLE:-false}"
                 "++harbor_agent.responses_api_agents.harbor_agent.sandbox_pool.fallback_create_for_preallocated_handle=${GYM_SANDBOX_POOL_FALLBACK_CREATE_FOR_PREALLOCATED_HANDLE:-true}"
                 "++harbor_agent.responses_api_agents.harbor_agent.sandbox_pool.prewarm_environment_setup=${GYM_SANDBOX_POOL_PREWARM_ENVIRONMENT_SETUP:-false}"
-                "++harbor_agent.responses_api_agents.harbor_agent.sandbox_pool.prewarm_policy_proxy=${GYM_SANDBOX_POOL_PREWARM_POLICY_PROXY:-false}"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batch_create_retries=10"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batch_create_retry_delay_s=2.0"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batch_create_retry_max_delay_s=90.0"
@@ -1167,9 +1152,6 @@ spec:
                 )
                 if [ "${GYM_SANDBOX_POOL_PREWARM_ENVIRONMENT_SETUP:-0}" = "1" ]; then
                   PREWARM_ARGS+=(--prepare-environment)
-                fi
-                if [ "${GYM_SANDBOX_POOL_PREWARM_POLICY_PROXY:-0}" = "1" ]; then
-                  PREWARM_ARGS+=(--start-policy-proxy)
                 fi
                 "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/prewarm_gym_harbor_sandboxes.py" \
                   "${PREWARM_ARGS[@]}" \
@@ -1302,8 +1284,6 @@ spec:
               value: "false"
             - name: GYM_SANDBOX_POOL_PREWARM_ENVIRONMENT_SETUP
               value: "1"
-            - name: GYM_SANDBOX_POOL_PREWARM_POLICY_PROXY
-              value: "0"
             - name: GYM_SANDBOX_POOL_PREWARM_CONCURRENCY
               value: "2"
             - name: GYM_SANDBOX_POOL_PREWARM_CREATE_CONCURRENCY
@@ -1316,6 +1296,8 @@ spec:
               value: "2"
             - name: GYM_SANDBOX_POOL_STREAM_CHUNK_CONCURRENCY
               value: "1"
+            - name: GYM_COLLECT_ROLLOUTS_TIMEOUT_S
+              value: ""
             - name: HARBOR_UPLOAD_ENVIRONMENT_DIR
               value: "false"
             - name: OPENSANDBOX_CREATE_PROBE_COMMAND
@@ -1344,8 +1326,6 @@ spec:
               value: "1"
             - name: MINI_SWE_CONFIG_STEP_LIMIT
               value: ""
-            - name: EVAL_SKIP_POLICY_PROXY
-              value: "1"
             - name: HARBOR_RUN_TIMEOUT
               value: "3900"
             - name: GENERATION_TEMPERATURE
@@ -1358,8 +1338,6 @@ spec:
               value: "true"
             - name: GENERATION_MAX_OUTPUT_TOKENS
               value: "49152"
-            - name: POLICY_PROXY_RESPONSES_UPSTREAM_API
-              value: responses
             - name: NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_LIVE_INTERVAL_S
               value: "15"
             - name: NEMO_GYM_REBUILD_VENVS

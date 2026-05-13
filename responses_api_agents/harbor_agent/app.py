@@ -20,7 +20,7 @@ import threading
 from asyncio import Semaphore
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Callable, Literal, Optional
 from uuid import uuid4
 
@@ -77,11 +77,6 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
     # Optional model-name template for installed agents that expect provider/model.
     # Supports "{model_name}" and "{target_base_url}".
     harbor_agent_model_name: Optional[str] = None
-    # Optional policy proxy config for installed agents. When set, the proxy is
-    # started inside the sandbox and its policy_trace.jsonl is used for
-    # trainable token IDs/logprobs.
-    harbor_policy_proxy: Optional[dict[str, Any]] = None
-
     # --- Dataset routing ---
     # Map of dataset aliases to source definitions. Each alias must define exactly
     # one source:
@@ -150,17 +145,10 @@ class HarborSandboxPrewarmRequest(BaseModel):
     prepare_concurrency: Optional[int] = None
     replace_existing: bool = False
     prepare_environment: Optional[bool] = None
-    start_policy_proxy: Optional[bool] = None
 
 
 class HarborSandboxCleanupRequest(BaseModel):
     delete: bool = True
-
-
-class HarborSandboxProgressRequest(BaseModel):
-    keys: Optional[list[str]] = None
-    limit: int = 20
-    timeout_s: int = 20
 
 
 class HarborSandboxPoolSnapshot(BaseModel):
@@ -330,7 +318,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
     _sandbox_pool_idle_tokens: dict[str, str] = PrivateAttr(default_factory=dict)
     _sandbox_pool_borrowed_tokens: dict[str, str] = PrivateAttr(default_factory=dict)
     _sandbox_pool_handles: dict[str, Any] = PrivateAttr(default_factory=dict)
-    _sandbox_pool_progress_probe_tokens: set[str] = PrivateAttr(default_factory=set)
     _sandbox_pool_errors: dict[str, str] = PrivateAttr(default_factory=dict)
     _sandbox_pool_exhausted_total: int = PrivateAttr(default=0)
     _sandbox_pool_direct_create_total: int = PrivateAttr(default=0)
@@ -358,7 +345,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
         app.post("/prewarm_sandboxes")(self.prewarm_sandboxes)
         app.post("/cleanup_prewarmed_sandboxes")(self.cleanup_prewarmed_sandboxes)
         app.get("/sandbox_pool_snapshot")(self.sandbox_pool_snapshot)
-        app.post("/sandbox_pool_progress")(self.sandbox_pool_progress)
         return app
 
     async def responses(self, body: NeMoGymResponseCreateParamsNonStreaming = Body()) -> NeMoGymResponse:
@@ -438,14 +424,12 @@ class HarborAgent(SimpleResponsesAPIAgent):
                     verifier_result = trial_result.get("verifier_result")
                     reward = HarborAgentUtils.extract_reward(verifier_result)
 
-                    policy_trace_rollout_details = self._load_policy_trace_rollout_details(trial_dir)
-
                     # Convert Harbor outputs to NeMo Gym response items:
-                    # keep rich trajectory details, then overlay rollout token details when present.
+                    # keep rich trajectory details from the Harbor agent.
                     output_items = HarborAgentUtils.trial_result_to_responses(
                         trial_result,
                         trajectory,
-                        policy_trace_rollout_details,
+                        None,
                         output_mode=self.config.response_output_mode,
                     )
 
@@ -459,7 +443,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
                     print(f"Error running Harbor job: {e}")
                     trial_result = None
                     trajectory = None
-                    policy_trace_rollout_details = None
                     agent_error_flags = {}
                     output_items = []
                     input_messages = []
@@ -545,11 +528,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
             create_semaphore = asyncio.Semaphore(max(1, int(create_concurrency)))
             prepare_semaphore = asyncio.Semaphore(max(1, int(prepare_concurrency)))
             prepare_environment = self._sandbox_pool_prepare_environment(body)
-            start_policy_proxy = self._sandbox_pool_start_policy_proxy(body)
-            policy_proxy_config = self._sandbox_pool_policy_proxy_config()
-            start_policy_proxy = start_policy_proxy and policy_proxy_config is not None
-            if start_policy_proxy:
-                prepare_environment = True
             created = 0
             reused = 0
             errors: dict[str, str] = {}
@@ -578,7 +556,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 await self._prepare_prewarmed_handle(
                     instance_id,
                     handle,
-                    policy_proxy_config=(policy_proxy_config if start_policy_proxy else None),
                 )
 
         async def _prewarm_group(instance_id: str, keyed_items: list[tuple[str, HarborSandboxPrewarmItem]]) -> None:
@@ -606,7 +583,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
                             token,
                             handle,
                             prepared_environment=prepare_environment,
-                            policy_proxy_started=start_policy_proxy,
                         )
                 created += len(handles)
             except Exception as e:
@@ -663,77 +639,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
 
     async def sandbox_pool_snapshot(self) -> HarborSandboxPoolSnapshot:
         return HarborSandboxPoolSnapshot(**self._sandbox_pool_snapshot_dict())
-
-    async def sandbox_pool_progress(
-        self,
-        body: Optional[HarborSandboxProgressRequest] = Body(default=None),
-    ) -> dict[str, Any]:
-        body = body or HarborSandboxProgressRequest()
-        limit = min(
-            max(1, int(body.limit)),
-            self._sandbox_pool_progress_probe_limit(),
-        )
-        timeout_s = max(1, int(body.timeout_s))
-        requested_keys = set(body.keys or [])
-        async with self._sandbox_pool_lock:
-            borrowed_items = list(self._sandbox_pool_borrowed_tokens.items())
-            if requested_keys:
-                borrowed_items = [item for item in borrowed_items if item[0] in requested_keys]
-            selected_items = borrowed_items[:limit]
-            selected = [(key, token, self._sandbox_pool_handles.get(token)) for key, token in selected_items]
-            missing = [key for key, token in selected_items if token not in self._sandbox_pool_handles]
-            provider = self._sandbox_pool_provider
-
-        if provider is None:
-            return {
-                "snapshot": self._sandbox_pool_snapshot_dict(),
-                "progress": {},
-                "errors": {"provider": "sandbox pool provider is not initialized"},
-            }
-
-        progress_semaphore = asyncio.Semaphore(self._sandbox_pool_progress_probe_concurrency())
-
-        async def _probe(key: str, token: str, handle_ref: Any) -> tuple[str, dict[str, Any]]:
-            async with progress_semaphore:
-                if handle_ref is None:
-                    return key, {"error": "handle_not_found"}
-                try:
-                    from responses_api_agents.harbor_agent.sandbox import (
-                        _PROGRESS_PROBE_PATH,
-                        _PROGRESS_PROBE_SCRIPT,
-                    )
-
-                    handle = await self._sandbox_pool_materialize_handle(handle_ref)
-                    if token not in self._sandbox_pool_progress_probe_tokens:
-                        await provider.write_file(
-                            handle,
-                            _PROGRESS_PROBE_PATH,
-                            _PROGRESS_PROBE_SCRIPT,
-                        )
-                        self._sandbox_pool_progress_probe_tokens.add(token)
-                    result = await provider.exec(
-                        handle,
-                        f"python3 {_PROGRESS_PROBE_PATH}",
-                        user="root",
-                        timeout_s=timeout_s,
-                    )
-                    if result.return_code != 0:
-                        return key, {
-                            "error": "progress_probe_failed",
-                            "return_code": result.return_code,
-                            "stdout": result.stdout,
-                            "stderr": result.stderr,
-                        }
-                    return key, json.loads(result.stdout or "{}")
-                except Exception as e:
-                    return key, {"error": type(e).__name__, "message": str(e)}
-
-        progress_pairs = await asyncio.gather(*(_probe(key, token, handle) for key, token, handle in selected))
-        return {
-            "snapshot": self._sandbox_pool_snapshot_dict(),
-            "progress": dict(progress_pairs),
-            "missing": missing,
-        }
 
     def _get_results_output_dir(self, policy_model_name: str, dataset_alias: str, run_timestamp: datetime) -> Path:
         """Build immutable run output directory grouped by date/dataset/model."""
@@ -821,17 +726,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
         )
         return f"http://{model_server_config['host']}:{model_server_config['port']}/v1"
 
-    def _load_policy_trace_rollout_details(self, trial_dir: Path) -> Optional[list[dict[str, Any]]]:
-        if not self.config.harbor_policy_proxy:
-            return None
-        trace_file = str(self.config.harbor_policy_proxy.get("trace_file", "policy_trace.jsonl"))
-        trace_path = trial_dir / "agent" / trace_file
-        if not trace_path.exists():
-            return None
-        from responses_api_agents.harbor_agent.trajectory import load_policy_trace_jsonl
-
-        return list(load_policy_trace_jsonl(trace_path))
-
     def _sandbox_pool_config(self) -> dict[str, Any]:
         return dict(self.config.sandbox_pool or {})
 
@@ -856,18 +750,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
         if self._sandbox_pool_idle_tokens:
             return "healthy"
         return "empty"
-
-    def _sandbox_pool_progress_probe_limit(self) -> int:
-        return max(
-            1,
-            int(self._sandbox_pool_config().get("progress_probe_limit", 32)),
-        )
-
-    def _sandbox_pool_progress_probe_concurrency(self) -> int:
-        return max(
-            1,
-            int(self._sandbox_pool_config().get("progress_probe_concurrency", 16)),
-        )
 
     def _sandbox_pool_snapshot_dict(self) -> dict[str, Any]:
         return {
@@ -945,7 +827,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
         handle: Any,
         *,
         prepared_environment: bool = False,
-        policy_proxy_started: bool = False,
     ) -> None:
         from responses_api_agents.harbor_agent.sandbox import (
             _PREALLOCATED_HANDLES,
@@ -958,7 +839,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
             self._sandbox_pool_provider,
             handle,
             prepared_environment=prepared_environment,
-            policy_proxy_started=policy_proxy_started,
         )
         _PREALLOCATED_HANDLES[token] = handle_ref
         self._sandbox_pool_idle_tokens[key] = token
@@ -1026,7 +906,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 if idle_token == token:
                     self._sandbox_pool_idle_tokens.pop(idle_key, None)
             self._sandbox_pool_handles.pop(token, None)
-            self._sandbox_pool_progress_probe_tokens.discard(token)
             _PREALLOCATED_HANDLES.pop(token, None)
 
     def _create_sandbox_pool_provider(self) -> Any:
@@ -1043,11 +922,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
             return body.prepare_environment
         return bool(self._sandbox_pool_config().get("prewarm_environment_setup", False))
 
-    def _sandbox_pool_start_policy_proxy(self, body: HarborSandboxPrewarmRequest) -> bool:
-        if body.start_policy_proxy is not None:
-            return body.start_policy_proxy
-        return bool(self._sandbox_pool_config().get("prewarm_policy_proxy", False))
-
     def _sandbox_pool_task_dir(self, instance_id: str) -> Path:
         dataset_alias, task_name = self._parse_instance_id(instance_id)
         dataset_source = self.config.harbor_datasets.get(dataset_alias)
@@ -1061,13 +935,9 @@ class HarborAgent(SimpleResponsesAPIAgent):
         self,
         instance_id: str,
         handle: Any,
-        *,
-        policy_proxy_config: Optional[dict[str, Any]] = None,
     ) -> None:
         from responses_api_agents.harbor_agent.sandbox import (
-            install_policy_proxy_client_config_for_handle,
             prepare_harbor_sandbox_environment,
-            start_policy_proxy_for_handle,
         )
 
         if self._sandbox_pool_provider is None:
@@ -1086,23 +956,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
             span_name="sandbox.prewarm.setup",
             phase="prewarm",
         )
-        if policy_proxy_config is not None:
-            from nemo_gym.sandbox.observability import observability_span
-
-            async with observability_span(
-                "sandbox.policy_proxy.prewarm_start",
-                phase="prewarm",
-            ):
-                await start_policy_proxy_for_handle(
-                    self._sandbox_pool_provider,
-                    handle,
-                    policy_proxy_config,
-                )
-                await install_policy_proxy_client_config_for_handle(
-                    self._sandbox_pool_provider,
-                    handle,
-                    policy_proxy_config,
-                )
 
     def _build_sandbox_pool_spec(self, instance_id: str) -> Any:
         from harbor.models.task.config import TaskConfig
@@ -1190,7 +1043,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
         self._sandbox_pool_idle_tokens.clear()
         self._sandbox_pool_borrowed_tokens.clear()
         self._sandbox_pool_handles.clear()
-        self._sandbox_pool_progress_probe_tokens.clear()
         if provider is not None:
             try:
                 await _close_provider_resources(provider)
@@ -1207,81 +1059,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
         if isinstance(value, list):
             return [self._format_config_value(inner, format_values) for inner in value]
         return value
-
-    def _build_environment_policy_proxy_config(
-        self,
-        *,
-        model_name: str,
-        api_base: str,
-        policy_target_base_url: Optional[str],
-    ) -> tuple[Optional[dict[str, Any]], dict[str, str], dict[str, str]]:
-        if not self.config.harbor_policy_proxy:
-            return (
-                None,
-                {},
-                {
-                    "model_name": model_name,
-                    "target_base_url": api_base,
-                    "policy_base_url": policy_target_base_url or api_base,
-                },
-            )
-
-        proxy_config = dict(self.config.harbor_policy_proxy)
-        trace_file = str(proxy_config.get("trace_file", "policy_trace.jsonl"))
-        port = int(proxy_config["port"])
-        proxy_root_url = f"http://127.0.0.1:{port}"
-        proxy_base_url = f"{proxy_root_url}/v1"
-        format_values = {
-            "model_name": model_name,
-            "target_base_url": api_base,
-            "policy_base_url": policy_target_base_url or api_base,
-            "proxy_root_url": proxy_root_url,
-            "proxy_base_url": proxy_base_url,
-        }
-
-        proxy_env = {
-            key: self._format_config_value(value, format_values)
-            for key, value in (proxy_config.get("env") or {}).items()
-        }
-        environment_policy_proxy = {
-            "target_base_url": self._format_config_value(
-                proxy_config.get("target_base_url", "{policy_base_url}"),
-                format_values,
-            ),
-            "port": port,
-            "trace_path": str(PurePosixPath("/logs/agent") / trace_file),
-            "script_path": proxy_config["script_path"],
-            "env": proxy_env,
-        }
-        for key in (
-            "backend",
-            "litellm_provider",
-            "upstream_model_name",
-            "responses_upstream_api",
-            "generation_temperature",
-            "generation_top_p",
-            "generation_top_k",
-            "generation_chat_template_kwargs",
-            "force_generation_params",
-        ):
-            if key in proxy_config:
-                environment_policy_proxy[key] = self._format_config_value(
-                    proxy_config[key],
-                    format_values,
-                )
-        return environment_policy_proxy, proxy_env, format_values
-
-    def _sandbox_pool_policy_proxy_config(self) -> Optional[dict[str, Any]]:
-        if not self.config.harbor_policy_proxy:
-            return None
-        global_config_dict = get_global_config_dict()
-        policy_model_name = global_config_dict["policy_model_name"]
-        environment_policy_proxy, _, _ = self._build_environment_policy_proxy_config(
-            model_name=policy_model_name,
-            api_base=self._resolve_model_base_url(global_config_dict),
-            policy_target_base_url=global_config_dict.get("policy_base_url"),
-        )
-        return environment_policy_proxy
 
     def _build_job_config(
         self,
@@ -1306,15 +1083,11 @@ class HarborAgent(SimpleResponsesAPIAgent):
             VerifierConfig,
         )
 
-        (
-            environment_policy_proxy,
-            proxy_env,
-            format_values,
-        ) = self._build_environment_policy_proxy_config(
-            model_name=model_name,
-            api_base=api_base,
-            policy_target_base_url=policy_target_base_url,
-        )
+        format_values = {
+            "model_name": model_name,
+            "target_base_url": api_base,
+            "policy_base_url": policy_target_base_url or api_base,
+        }
 
         agent_kwargs: dict[str, Any] = {"api_base": api_base}
         if responses_create_params:
@@ -1341,13 +1114,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
         agent_env: dict[str, str] = {}
         if self.config.harbor_agent_env:
             agent_env.update(self.config.harbor_agent_env)
-
-        if self.config.harbor_policy_proxy and environment_policy_proxy is not None:
-            environment_kwargs["policy_proxy"] = environment_policy_proxy
-            agent_env.update(proxy_env)
-
-            for key, value in (self.config.harbor_policy_proxy.get("agent_kwargs") or {}).items():
-                agent_kwargs.setdefault(key, self._format_config_value(value, format_values))
 
         agent_model_name = model_name
         if self.config.harbor_agent_model_name:

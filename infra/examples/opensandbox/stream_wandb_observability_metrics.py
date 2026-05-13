@@ -114,30 +114,6 @@ def _flatten_metrics(
         ),
         "startup_borrow_setup": ("startup_breakdown_s", "borrow_setup"),
         "startup_prewarm_setup": ("startup_breakdown_s", "prewarm_setup"),
-        "startup_policy_proxy_start": (
-            "startup_breakdown_s",
-            "policy_proxy_start",
-        ),
-        "startup_policy_proxy_prewarm_start": (
-            "startup_breakdown_s",
-            "policy_proxy_prewarm_start",
-        ),
-        "startup_policy_proxy_start_success": (
-            "startup_breakdown_s",
-            "policy_proxy_start_success",
-        ),
-        "startup_policy_proxy_start_error": (
-            "startup_breakdown_s",
-            "policy_proxy_start_error",
-        ),
-        "startup_policy_proxy_prewarm_start_success": (
-            "startup_breakdown_s",
-            "policy_proxy_prewarm_start_success",
-        ),
-        "startup_policy_proxy_prewarm_start_error": (
-            "startup_breakdown_s",
-            "policy_proxy_prewarm_start_error",
-        ),
         "startup_upload_environment": (
             "startup_breakdown_s",
             "upload_environment",
@@ -384,46 +360,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "prewarm_setup_p99_s": _get_nested(
                     metrics,
                     ("startup_breakdown_s", "prewarm_setup", "p99"),
-                ),
-                "policy_proxy_start_p95_s": _get_nested(
-                    metrics,
-                    ("startup_breakdown_s", "policy_proxy_start", "p95"),
-                ),
-                "policy_proxy_start_p99_s": _get_nested(
-                    metrics,
-                    ("startup_breakdown_s", "policy_proxy_start", "p99"),
-                ),
-                "policy_proxy_prewarm_start_p95_s": _get_nested(
-                    metrics,
-                    ("startup_breakdown_s", "policy_proxy_prewarm_start", "p95"),
-                ),
-                "policy_proxy_prewarm_start_p99_s": _get_nested(
-                    metrics,
-                    ("startup_breakdown_s", "policy_proxy_prewarm_start", "p99"),
-                ),
-                "policy_proxy_prewarm_start_success_p95_s": _get_nested(
-                    metrics,
-                    (
-                        "startup_breakdown_s",
-                        "policy_proxy_prewarm_start_success",
-                        "p95",
-                    ),
-                ),
-                "policy_proxy_prewarm_start_success_p99_s": _get_nested(
-                    metrics,
-                    (
-                        "startup_breakdown_s",
-                        "policy_proxy_prewarm_start_success",
-                        "p99",
-                    ),
-                ),
-                "policy_proxy_prewarm_start_error_count": _get_nested(
-                    metrics,
-                    (
-                        "startup_breakdown_s",
-                        "policy_proxy_prewarm_start_error",
-                        "count",
-                    ),
                 ),
                 "upload_environment_p95_s": _get_nested(
                     metrics,

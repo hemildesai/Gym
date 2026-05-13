@@ -27,10 +27,7 @@ import tempfile
 import time
 import tomllib
 from collections.abc import Iterator
-from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass, field
-from importlib import resources
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 from uuid import uuid4
@@ -62,7 +59,6 @@ from nemo_gym.sandbox.observability.render import safe_report_name
 from responses_api_agents.harbor_agent.trajectory import (
     SandboxRolloutContext,
     SandboxTrajectory,
-    load_policy_trace_jsonl,
 )
 
 
@@ -75,7 +71,6 @@ def _require_harbor() -> dict[str, Any]:
         from harbor.environments.base import BaseSandbox, ExecResult
         from harbor.models.trial.config import TrialConfig
         from harbor.models.trial.paths import EnvironmentPaths
-        from harbor.trial.hooks import TrialEvent
         from harbor.trial.trial import Trial
     except ModuleNotFoundError as e:
         raise ModuleNotFoundError(
@@ -89,7 +84,6 @@ def _require_harbor() -> dict[str, Any]:
         "ExecResult": ExecResult,
         "Trial": Trial,
         "TrialConfig": TrialConfig,
-        "TrialEvent": TrialEvent,
     }
 
 
@@ -145,22 +139,6 @@ def _rewrite_sandbox_image(
     return image
 
 
-def _codex_policy_proxy_config_toml(openai_base_url: str) -> str:
-    return "\n".join(
-        [
-            'model_provider = "nemo_rl_policy_proxy"',
-            "disable_response_storage = true",
-            "",
-            "[model_providers.nemo_rl_policy_proxy]",
-            'name = "NeMo-RL policy proxy"',
-            f"base_url = {json.dumps(openai_base_url)}",
-            'wire_api = "responses"',
-            'env_key = "OPENAI_API_KEY"',
-            "",
-        ]
-    )
-
-
 try:
     _HARBOR_IMPORTS = _require_harbor()
     _BaseSandbox = _HARBOR_IMPORTS["BaseSandbox"]
@@ -171,7 +149,6 @@ except ModuleNotFoundError:
 _PREALLOCATED_HANDLE_ROW_KEY = "_nemo_rl_preallocated_handle_token"
 _PREALLOCATED_HANDLES: dict[str, Any] = {}
 _PREALLOCATED_ENVIRONMENT_PREPARED_KEY = "prepared_environment"
-_PREALLOCATED_POLICY_PROXY_STARTED_KEY = "policy_proxy_started"
 
 
 def _preallocated_handle_reference(
@@ -179,30 +156,21 @@ def _preallocated_handle_reference(
     handle: SandboxHandle,
     *,
     prepared_environment: bool = False,
-    policy_proxy_started: bool = False,
 ) -> Any:
     """Return a loop-neutral preallocated-handle value when supported."""
     make_reference = getattr(provider, "handle_reference", None)
     if make_reference is None:
         return handle
     reference = make_reference(handle)
-    if isinstance(reference, dict) and (prepared_environment or policy_proxy_started):
+    if isinstance(reference, dict) and prepared_environment:
         reference = dict(reference)
-        if prepared_environment:
-            reference[_PREALLOCATED_ENVIRONMENT_PREPARED_KEY] = True
-        if policy_proxy_started:
-            reference[_PREALLOCATED_POLICY_PROXY_STARTED_KEY] = True
+        reference[_PREALLOCATED_ENVIRONMENT_PREPARED_KEY] = True
     return reference
 
 
 def _preallocated_handle_environment_prepared(value: Any) -> bool:
     """Return whether deterministic environment setup was done in prewarm."""
     return bool(isinstance(value, dict) and value.get(_PREALLOCATED_ENVIRONMENT_PREPARED_KEY, False))
-
-
-def _preallocated_handle_policy_proxy_started(value: Any) -> bool:
-    """Return whether the policy proxy was started during prewarm."""
-    return bool(isinstance(value, dict) and value.get(_PREALLOCATED_POLICY_PROXY_STARTED_KEY, False))
 
 
 async def _materialize_preallocated_handle(
@@ -226,14 +194,6 @@ async def _materialize_preallocated_handle(
     return result
 
 
-_PROGRESS_PROBE_SCRIPT = (
-    resources.files("responses_api_agents.harbor_agent").joinpath("progress_probe.py").read_text(encoding="utf-8")
-)
-_POLICY_PROXY_SCRIPT = (
-    resources.files("responses_api_agents.harbor_agent").joinpath("policy_proxy_server.py").read_text(encoding="utf-8")
-)
-_PROGRESS_PROBE_PATH = "/tmp/nemo_rl_sandbox_progress_probe.py"
-_POLICY_PROXY_OBSERVABILITY_EVENTS_FILE = "nemo_rl_observability_events.jsonl"
 _START_PROBE_COMMAND = "printf nemo-rl-sandbox-start-ready"
 _START_PROBE_EXPECTED_STDOUT = "nemo-rl-sandbox-start-ready"
 _AGENT_LOG_DIR = "/logs/agent"
@@ -475,130 +435,6 @@ async def prepare_harbor_sandbox_environment(
                 )
 
 
-async def start_policy_proxy_for_handle(
-    provider: Any,
-    handle: SandboxHandle,
-    policy_proxy_config: dict[str, Any],
-) -> None:
-    """Start the policy proxy inside a sandbox handle."""
-    script_path = policy_proxy_config["script_path"]
-    trace_path = policy_proxy_config["trace_path"]
-    port = policy_proxy_config["port"]
-    pid_path = "/tmp/nemo-rl-policy-proxy.pid"
-    await provider.write_file(handle, script_path, _POLICY_PROXY_SCRIPT)
-    command = (
-        f"python3 {shlex.quote(script_path)} "
-        "--target-base-url "
-        f"{shlex.quote(policy_proxy_config['target_base_url'])} "
-        f"--trace-path {shlex.quote(trace_path)} "
-        "--host 127.0.0.1 "
-        f"--port {int(port)}"
-    )
-    if "backend" in policy_proxy_config:
-        command += f" --backend {shlex.quote(str(policy_proxy_config['backend']))}"
-    if "litellm_provider" in policy_proxy_config:
-        command += f" --litellm-provider {shlex.quote(str(policy_proxy_config['litellm_provider']))}"
-    if "upstream_model_name" in policy_proxy_config:
-        command += f" --upstream-model-name {shlex.quote(str(policy_proxy_config['upstream_model_name']))}"
-    if policy_proxy_config.get("generation_temperature") is not None:
-        command += f" --generation-temperature {float(policy_proxy_config['generation_temperature'])}"
-    if policy_proxy_config.get("generation_top_p") is not None:
-        command += f" --generation-top-p {float(policy_proxy_config['generation_top_p'])}"
-    if policy_proxy_config.get("generation_top_k") is not None:
-        command += f" --generation-top-k {int(policy_proxy_config['generation_top_k'])}"
-    if policy_proxy_config.get("generation_chat_template_kwargs") is not None:
-        chat_template_kwargs = json.dumps(
-            policy_proxy_config["generation_chat_template_kwargs"],
-            separators=(",", ":"),
-        )
-        command += f" --generation-chat-template-kwargs-json {shlex.quote(chat_template_kwargs)}"
-    if policy_proxy_config.get("force_generation_params"):
-        command += " --force-generation-params"
-    if "responses_upstream_api" in policy_proxy_config:
-        command += f" --responses-upstream-api {shlex.quote(str(policy_proxy_config['responses_upstream_api']))}"
-    command += f" >/logs/agent/policy-proxy.log 2>&1 & echo $! >{shlex.quote(pid_path)}"
-    ready_probe = "python3 -c " + shlex.quote(
-        "import os, socket, sys, time\n"
-        f"port = {int(port)}\n"
-        f"pid_path = {pid_path!r}\n"
-        "deadline = time.monotonic() + 10.0\n"
-        "pid = None\n"
-        "while time.monotonic() < deadline:\n"
-        "    if pid is None:\n"
-        "        try:\n"
-        "            with open(pid_path, 'r', encoding='utf-8') as f:\n"
-        "                pid = int(f.read().strip())\n"
-        "        except Exception:\n"
-        "            pid = None\n"
-        "    try:\n"
-        "        with socket.create_connection(('127.0.0.1', port), 0.2):\n"
-        "            sys.exit(0)\n"
-        "    except OSError:\n"
-        "        pass\n"
-        "    if pid is not None:\n"
-        "        try:\n"
-        "            os.kill(pid, 0)\n"
-        "        except OSError:\n"
-        "            sys.exit(2)\n"
-        "    time.sleep(0.05)\n"
-        "sys.exit(1)\n"
-    )
-    await _exec_provider_checked(
-        provider,
-        handle,
-        "mkdir -p "
-        f"{shlex.quote(str(PurePosixPath(trace_path).parent))} "
-        f"{shlex.quote(str(PurePosixPath(script_path).parent))}; "
-        "if [ -f {pid_path} ]; then "
-        "kill $(cat {pid_path}) >/dev/null 2>&1 || true; "
-        "rm -f {pid_path}; "
-        "fi; "
-        "rm -f {trace_path} /logs/agent/policy-proxy.log; "
-        "{command}; "
-        "{ready_probe} && exit 0; "
-        "cat /logs/agent/policy-proxy.log >&2 || true; exit 1".format(
-            pid_path=shlex.quote(pid_path),
-            trace_path=shlex.quote(trace_path),
-            command=command,
-            ready_probe=ready_probe,
-        ),
-        phase="policy_proxy_start",
-        user="root",
-        env={
-            "NEMO_RL_SANDBOX_OBSERVABILITY_EVENTS_PATH": str(
-                PurePosixPath("/logs/agent") / _POLICY_PROXY_OBSERVABILITY_EVENTS_FILE
-            )
-        },
-    )
-
-
-async def install_policy_proxy_client_config_for_handle(
-    provider: Any,
-    handle: SandboxHandle,
-    policy_proxy_config: dict[str, Any],
-) -> None:
-    """Install client config for installed agents that read local config files."""
-    env = policy_proxy_config.get("env", {})
-    openai_base_url = env.get("OPENAI_BASE_URL") if isinstance(env, dict) else None
-    if not isinstance(openai_base_url, str) or not openai_base_url:
-        return
-
-    imports = _require_harbor()
-    config_path = imports["EnvironmentPaths"].agent_dir / "config.toml"
-    config = _codex_policy_proxy_config_toml(openai_base_url)
-    await _exec_provider_checked(
-        provider,
-        handle,
-        "mkdir -p {parent}; printf %s {config} > {path}".format(
-            parent=shlex.quote(str(config_path.parent)),
-            config=shlex.quote(config),
-            path=shlex.quote(str(config_path)),
-        ),
-        phase="policy_proxy_client_config",
-        user="root",
-    )
-
-
 class SandboxHarborEnvironment(_BaseSandbox):
     """Harbor ``BaseSandbox`` implemented through NeMo Gym's sandbox layer.
 
@@ -611,7 +447,6 @@ class SandboxHarborEnvironment(_BaseSandbox):
         *args: Any,
         provider: SandboxProviderConfig | None = None,
         spec: dict[str, Any] | None = None,
-        policy_proxy: dict[str, Any] | None = None,
         environment_target_dir: str = "/app",
         upload_environment_dir: bool = True,
         preallocated_handle_token: str | None = None,
@@ -634,7 +469,6 @@ class SandboxHarborEnvironment(_BaseSandbox):
         self._provider_config = provider
         self._sandbox = Sandbox(provider)
         self._spec_config = spec
-        self._policy_proxy_config = policy_proxy
         self._environment_target_dir = environment_target_dir.rstrip("/") or "/app"
         self._upload_environment_dir = upload_environment_dir
         self._preallocated_handle_token = preallocated_handle_token
@@ -653,15 +487,12 @@ class SandboxHarborEnvironment(_BaseSandbox):
         self._default_exec_timeout_s = default_exec_timeout_s
         self._default_cwd_enabled = False
         self._handle: SandboxHandle | None = None
-        self._progress_probe_installed = False
         self._observability_context = observability_context or {}
         self._observability_recorder_token: Any | None = None
         self._observability_context_token: Any | None = None
         self._resource_sampler: SandboxResourceSampler | None = None
 
         super().__init__(*args, **kwargs)
-        if self._policy_proxy_config is not None:
-            self._persistent_env.update(self._policy_proxy_config["env"])
 
     @staticmethod
     def type() -> Any:
@@ -794,7 +625,6 @@ class SandboxHarborEnvironment(_BaseSandbox):
         del force_build
         self._activate_observability()
         preallocated_environment_prepared = False
-        preallocated_policy_proxy_started = False
         async with observability_span(
             "sandbox.start",
             phase="startup",
@@ -811,7 +641,6 @@ class SandboxHarborEnvironment(_BaseSandbox):
                         f"Unknown preallocated OpenSandbox handle token {self._preallocated_handle_token!r}"
                     ) from e
                 preallocated_environment_prepared = _preallocated_handle_environment_prepared(preallocated_value)
-                preallocated_policy_proxy_started = _preallocated_handle_policy_proxy_started(preallocated_value)
                 self._handle = await _materialize_preallocated_handle(
                     self._sandbox,
                     preallocated_value,
@@ -832,7 +661,6 @@ class SandboxHarborEnvironment(_BaseSandbox):
                         self._preallocated_handle_token = None
                         self._handle = await self._sandbox.create(self._build_spec())
                         preallocated_environment_prepared = False
-                        preallocated_policy_proxy_started = False
             else:
                 self._handle = await self._sandbox.create(self._build_spec())
             self._start_resource_sampler()
@@ -849,13 +677,6 @@ class SandboxHarborEnvironment(_BaseSandbox):
                     phase="setup",
                 )
             self._default_cwd_enabled = self._default_cwd is not None
-            if self._policy_proxy_config is not None and not preallocated_policy_proxy_started:
-                async with observability_span(
-                    "sandbox.policy_proxy.start",
-                    phase="setup",
-                ):
-                    await self._start_policy_proxy()
-                    await self._install_policy_proxy_client_config()
 
     async def _exec_checked(
         self,
@@ -911,35 +732,6 @@ class SandboxHarborEnvironment(_BaseSandbox):
                 f"stderr={(result.stderr or '')[:200]!r}"
             )
 
-    async def agent_progress_snapshot(self) -> dict[str, Any]:
-        """Return a best-effort snapshot of agent progress inside the sandbox."""
-        if not self._progress_probe_installed:
-            await self._sandbox.write_file(self._require_handle(), _PROGRESS_PROBE_PATH, _PROGRESS_PROBE_SCRIPT)
-            self._progress_probe_installed = True
-
-        result = await self.exec(
-            f"python3 {shlex.quote(_PROGRESS_PROBE_PATH)}",
-            cwd="/",
-            user="root",
-            timeout_sec=20,
-        )
-        if result.return_code != 0:
-            return {
-                "error": "progress_probe_failed",
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "return_code": result.return_code,
-            }
-        try:
-            return cast(dict[str, Any], json.loads(result.stdout or "{}"))
-        except json.JSONDecodeError:
-            return {
-                "error": "progress_probe_invalid_json",
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "return_code": result.return_code,
-            }
-
     async def stop(self, delete: bool) -> None:
         if self._resource_sampler is not None:
             await self._resource_sampler.stop()
@@ -965,20 +757,6 @@ class SandboxHarborEnvironment(_BaseSandbox):
         if self._handle is None:
             raise RuntimeError("SandboxHarborEnvironment has not been started")
         return self._handle
-
-    async def _start_policy_proxy(self) -> None:
-        await start_policy_proxy_for_handle(
-            self._sandbox,
-            self._require_handle(),
-            cast(dict[str, Any], self._policy_proxy_config),
-        )
-
-    async def _install_policy_proxy_client_config(self) -> None:
-        await install_policy_proxy_client_config_for_handle(
-            self._sandbox,
-            self._require_handle(),
-            cast(dict[str, Any], self._policy_proxy_config),
-        )
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
         source = Path(source_path)
@@ -1031,11 +809,6 @@ class SandboxHarborEnvironment(_BaseSandbox):
             recorder = current_recorder()
             if recorder is not None:
                 trajectory_id = self._observability_context.get("trajectory_id", self.environment_name)
-                recorder.ingest_jsonl(
-                    target / _POLICY_PROXY_OBSERVABILITY_EVENTS_FILE,
-                    trajectory_id=trajectory_id,
-                    source="policy_proxy",
-                )
                 ingest_agent_trajectory_events(
                     target,
                     recorder=recorder,
@@ -1204,14 +977,11 @@ def _full_result_from_harbor(
     *,
     stop_reason: str,
     attempt_idx: int,
-    progress_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     full_result = cast(dict[str, Any], result.model_dump(mode="json"))
     full_result["rewards"] = rewards
     full_result["stop_reason"] = stop_reason
     full_result["attempt_idx"] = attempt_idx
-    if progress_summary is not None:
-        full_result["agent_progress"] = progress_summary
     if result.exception_info is not None:
         full_result["exception_info"] = result.exception_info.model_dump(mode="json")
     observability = _observability_artifacts(result.trial_name)
@@ -1232,14 +1002,11 @@ def _masked_trajectory(
     result: Any | None,
     stop_reason: str,
     error_message: str | None,
-    progress_summary: dict[str, Any] | None = None,
 ) -> SandboxTrajectory:
     full_result: dict[str, Any] = {
         "masked": True,
         "stop_reason": stop_reason,
     }
-    if progress_summary is not None:
-        full_result["agent_progress"] = progress_summary
     if error_message is not None:
         full_result["error_message"] = error_message
     if result is not None:
@@ -1265,211 +1032,6 @@ def _masked_trajectory(
     }
 
 
-def _file_snapshot_by_name(snapshot: dict[str, Any], name: str) -> dict[str, Any]:
-    for file_snapshot in snapshot.get("files", []):
-        if not isinstance(file_snapshot, dict):
-            continue
-        if PurePosixPath(str(file_snapshot.get("path", ""))).name == name:
-            return file_snapshot
-    return {}
-
-
-def _first_file_snapshot_by_name(snapshot: dict[str, Any], names: tuple[str, ...]) -> dict[str, Any]:
-    for name in names:
-        file_snapshot = _file_snapshot_by_name(snapshot, name)
-        if file_snapshot.get("exists"):
-            return file_snapshot
-    return {}
-
-
-def _compact_progress_processes(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
-    processes = []
-    for process in snapshot.get("processes", []):
-        if not isinstance(process, dict):
-            continue
-        cmdline = process.get("cmdline")
-        if not isinstance(cmdline, str):
-            continue
-        processes.append(
-            {
-                "pid": process.get("pid"),
-                "cmdline": cmdline[:180],
-            }
-        )
-    return processes[:8]
-
-
-def _progress_fingerprint(snapshot: dict[str, Any]) -> str:
-    files = []
-    for file_snapshot in snapshot.get("files", []):
-        if not isinstance(file_snapshot, dict):
-            continue
-        files.append(
-            {
-                "path": file_snapshot.get("path"),
-                "exists": file_snapshot.get("exists"),
-                "bytes": file_snapshot.get("bytes"),
-                "mtime": file_snapshot.get("mtime"),
-                "policy_trace": file_snapshot.get("policy_trace"),
-            }
-        )
-    processes = [process.get("cmdline") for process in snapshot.get("processes", []) if isinstance(process, dict)]
-    return json.dumps({"files": files, "processes": processes}, sort_keys=True)
-
-
-@dataclass
-class _ProgressMonitorState:
-    """Small state holder for sandbox progress snapshots."""
-
-    trial_name: str
-    snapshots: list[dict[str, Any]] = field(default_factory=list)
-    last_fingerprint: str | None = None
-    last_change_monotonic: float = field(default_factory=time.monotonic)
-    max_idle_s: float = 0.0
-
-    def update(self, snapshot: dict[str, Any]) -> tuple[bool, float]:
-        fingerprint = _progress_fingerprint(snapshot)
-        now = time.monotonic()
-        changed = fingerprint != self.last_fingerprint
-        if changed:
-            self.last_fingerprint = fingerprint
-            self.last_change_monotonic = now
-        idle_s = now - self.last_change_monotonic
-        self.max_idle_s = max(self.max_idle_s, idle_s)
-        self.snapshots.append(snapshot)
-        return changed, idle_s
-
-    def summary(self) -> dict[str, Any]:
-        if not self.snapshots:
-            return {
-                "trial_name": self.trial_name,
-                "snapshot_count": 0,
-            }
-        latest = self.snapshots[-1]
-        policy_trace = _file_snapshot_by_name(latest, "policy_trace.jsonl").get("policy_trace", {})
-        return {
-            "trial_name": self.trial_name,
-            "snapshot_count": len(self.snapshots),
-            "max_idle_s": self.max_idle_s,
-            "latest": latest,
-            "latest_policy_trace": policy_trace,
-        }
-
-
-def _progress_log_record(
-    *,
-    trial_name: str,
-    snapshot: dict[str, Any],
-    changed: bool,
-    idle_s: float,
-    stale_after_s: float,
-) -> dict[str, Any]:
-    policy_trace_file = _file_snapshot_by_name(snapshot, "policy_trace.jsonl")
-    policy_trace = policy_trace_file.get("policy_trace", {})
-    mini_swe_log = _file_snapshot_by_name(snapshot, "mini-swe-agent.txt")
-    agent_log = _first_file_snapshot_by_name(
-        snapshot,
-        (
-            "mini-swe-agent.txt",
-            "opencode.txt",
-            "openhands_sdk.txt",
-            "openhands.txt",
-            "aider.txt",
-            "codex.txt",
-            "claude-code.txt",
-        ),
-    )
-    trajectory_file = _first_file_snapshot_by_name(
-        snapshot,
-        (
-            "trajectory.json",
-            "mini-swe-agent.trajectory.json",
-            "openhands.trajectory.json",
-        ),
-    )
-    return {
-        "event": "sandbox_agent_progress",
-        "trial_name": trial_name,
-        "changed": changed,
-        "idle_s": round(idle_s, 3),
-        "stale": idle_s >= stale_after_s,
-        "process_count": len(snapshot.get("processes", [])),
-        "policy_trace_turns": policy_trace.get("turns"),
-        "policy_trace_completion_tokens": policy_trace.get("completion_tokens"),
-        "policy_trace_logprobs": policy_trace.get("logprobs"),
-        "mini_swe_log_bytes": mini_swe_log.get("bytes"),
-        "agent_log_path": agent_log.get("path"),
-        "agent_log_bytes": agent_log.get("bytes"),
-        "agent_trajectory_path": trajectory_file.get("path"),
-        "trajectory_bytes": trajectory_file.get("bytes"),
-        "active_processes": _compact_progress_processes(snapshot),
-    }
-
-
-async def _monitor_agent_progress(
-    trial: Any,
-    *,
-    config: dict[str, Any],
-    state: _ProgressMonitorState,
-    stop_event: asyncio.Event,
-) -> None:
-    interval_s = float(config.get("interval_sec", 60.0))
-    stale_after_s = float(config.get("stale_after_sec", 300.0))
-    snapshots_path = trial._trial_paths.agent_dir / "nemo_rl_agent_progress.jsonl"
-    snapshots_path.parent.mkdir(parents=True, exist_ok=True)
-
-    while True:
-        if stop_event.is_set():
-            return
-        try:
-            sandbox = trial._sandbox
-            if not hasattr(sandbox, "agent_progress_snapshot"):
-                return
-            snapshot = await sandbox.agent_progress_snapshot()
-            changed, idle_s = state.update(snapshot)
-            record = _progress_log_record(
-                trial_name=trial.config.trial_name,
-                snapshot=snapshot,
-                changed=changed,
-                idle_s=idle_s,
-                stale_after_s=stale_after_s,
-            )
-            with snapshots_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps({**record, "snapshot": snapshot}) + "\n")
-            print(json.dumps(record, sort_keys=True), flush=True)
-        except Exception as e:
-            print(
-                json.dumps(
-                    {
-                        "event": "sandbox_agent_progress",
-                        "trial_name": trial.config.trial_name,
-                        "error": str(e),
-                    },
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
-
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=interval_s)
-        except asyncio.TimeoutError:
-            continue
-        return
-
-
-def _progress_monitor_config(
-    integration_kwargs: dict[str, Any],
-) -> dict[str, Any] | None:
-    config = integration_kwargs.get("progress_monitor", None)
-    if config is None:
-        return None
-    if not isinstance(config, dict):
-        raise ValueError("progress_monitor must be a dictionary")
-    if not config.get("enabled", False):
-        return None
-    return config
-
-
 def _validate_harbor_config(sandbox_config: SandboxConfig) -> None:
     integration_kwargs = sandbox_config["integration"]["kwargs"]
     for required_key in ("trial_config", "environment_spec", "max_retries"):
@@ -1478,7 +1040,7 @@ def _validate_harbor_config(sandbox_config: SandboxConfig) -> None:
                 f"env.sandbox.integration.kwargs.{required_key} is required for the Harbor sandbox integration"
             )
 
-    if "policy_proxy" not in integration_kwargs and not integration_kwargs.get("eval_only", False):
+    if not integration_kwargs.get("eval_only", False):
         agent_kwargs = dict(integration_kwargs["trial_config"].get("agent", {}).get("kwargs", {}))
         agent_kwargs.update(integration_kwargs.get("agent_kwargs", {}))
         if not agent_kwargs.get("collect_rollout_details", False):
@@ -1486,9 +1048,7 @@ def _validate_harbor_config(sandbox_config: SandboxConfig) -> None:
                 "Harbor-native trainable trajectories require "
                 "env.sandbox.integration.kwargs.trial_config.agent.kwargs."
                 "collect_rollout_details=true, or the same key under "
-                "env.sandbox.integration.kwargs.agent_kwargs. Configure "
-                "policy_proxy only for installed CLI agents that cannot "
-                "populate Harbor rollout_details. Set integration_kwargs."
+                "env.sandbox.integration.kwargs.agent_kwargs. Set integration_kwargs."
                 "eval_only=true to bypass this check for evaluation runs "
                 "that do not need trainable token IDs/logprobs."
             )
@@ -1554,49 +1114,6 @@ def _trial_config_for_row(
         for key, value in integration_kwargs["agent_kwargs"].items():
             agent_kwargs[key] = _format_config_value(value, format_values)
 
-    if "policy_proxy" in integration_kwargs:
-        proxy_config = integration_kwargs["policy_proxy"]
-        trace_path = str(PurePosixPath("/logs/agent") / proxy_config["trace_file"])
-        proxy_root_url = f"http://127.0.0.1:{proxy_config['port']}"
-        proxy_base_url = f"http://127.0.0.1:{proxy_config['port']}/v1"
-        format_values["proxy_root_url"] = proxy_root_url
-        format_values["proxy_base_url"] = proxy_base_url
-        environment_kwargs["policy_proxy"] = {
-            "target_base_url": policy_base_url,
-            "port": proxy_config["port"],
-            "trace_path": trace_path,
-            "script_path": proxy_config["script_path"],
-            "env": {key: _format_config_value(value, format_values) for key, value in proxy_config["env"].items()},
-        }
-        if "backend" in proxy_config:
-            environment_kwargs["policy_proxy"]["backend"] = proxy_config["backend"]
-        if "litellm_provider" in proxy_config:
-            environment_kwargs["policy_proxy"]["litellm_provider"] = proxy_config["litellm_provider"]
-        if "upstream_model_name" in proxy_config:
-            environment_kwargs["policy_proxy"]["upstream_model_name"] = _format_config_value(
-                proxy_config["upstream_model_name"], format_values
-            )
-        if "responses_upstream_api" in proxy_config:
-            environment_kwargs["policy_proxy"]["responses_upstream_api"] = proxy_config["responses_upstream_api"]
-        for key in (
-            "generation_temperature",
-            "generation_top_p",
-            "generation_top_k",
-            "generation_chat_template_kwargs",
-            "force_generation_params",
-        ):
-            if key in proxy_config:
-                environment_kwargs["policy_proxy"][key] = proxy_config[key]
-
-        if not agent_cfg.get("model_name") and "model_name" in proxy_config:
-            agent_cfg["model_name"] = proxy_config["model_name"].format(**format_values)
-        agent_env = agent_cfg.setdefault("env", {})
-        agent_env.update(environment_kwargs["policy_proxy"]["env"])
-        if "agent_kwargs" in proxy_config:
-            agent_kwargs = agent_cfg.setdefault("kwargs", {})
-            for key, value in proxy_config["agent_kwargs"].items():
-                agent_kwargs.setdefault(key, _format_config_value(value, format_values))
-
     if "pre_agent_setup_commands" in integration_kwargs:
         environment_kwargs["pre_agent_setup_commands"] = _format_config_value(
             integration_kwargs["pre_agent_setup_commands"], format_values
@@ -1611,18 +1128,6 @@ def _trial_config_for_row(
             agent_env[env_name] = policy_base_url
 
     return trial_config_type.model_validate(config_dict)
-
-
-def _ingest_policy_proxy_observability(trial: Any) -> None:
-    recorder = current_recorder()
-    if recorder is None:
-        return
-    events_path = trial._trial_paths.agent_dir / _POLICY_PROXY_OBSERVABILITY_EVENTS_FILE
-    recorder.ingest_jsonl(
-        events_path,
-        trajectory_id=trial.config.trial_name,
-        source="policy_proxy",
-    )
 
 
 def _ingest_agent_trajectory_observability(trial: Any) -> None:
@@ -1643,15 +1148,12 @@ async def _run_harbor_trial(
 ) -> SandboxTrajectory:
     imports = _require_harbor()
     trial_type = imports["Trial"]
-    trial_event_type = imports["TrialEvent"]
     integration_kwargs = sandbox_config["integration"]["kwargs"]
     max_retries = integration_kwargs["max_retries"]
-    progress_config = _progress_monitor_config(integration_kwargs)
     attempt_row = dict(row)
     trial_config = _trial_config_for_row(attempt_row, sandbox_config, context)
     result = None
     last_error_message = None
-    last_progress_summary = None
     stop_reason = "error"
     trajectory_start_s = time.monotonic()
 
@@ -1663,30 +1165,11 @@ async def _run_harbor_trial(
             attributes={"attempt_idx": attempt_idx},
         ):
             trial = await trial_type.create(trial_config)
-        progress_state = _ProgressMonitorState(trial_name=trial.config.trial_name)
-        progress_stop_event: asyncio.Event | None = None
-        progress_task: asyncio.Task[None] | None = None
         with event_context(
             trajectory_id=trial.config.trial_name,
             trial_name=trial.config.trial_name,
             attempt_idx=attempt_idx,
         ):
-            if progress_config is not None:
-
-                async def _start_progress_monitor(_event: Any) -> None:
-                    nonlocal progress_stop_event, progress_task
-                    progress_stop_event = asyncio.Event()
-                    progress_task = asyncio.create_task(
-                        _monitor_agent_progress(
-                            trial,
-                            config=progress_config,
-                            state=progress_state,
-                            stop_event=progress_stop_event,
-                        )
-                    )
-
-                trial.add_hook(trial_event_type.AGENT_START, _start_progress_monitor)
-
             try:
                 async with observability_span(
                     "harbor.trial.run",
@@ -1712,15 +1195,6 @@ async def _run_harbor_trial(
                     stop_reason = "error"
                 continue
             finally:
-                if progress_stop_event is not None:
-                    progress_stop_event.set()
-                if progress_task is not None:
-                    try:
-                        await asyncio.wait_for(progress_task, timeout=5)
-                    except asyncio.TimeoutError:
-                        progress_task.cancel()
-                last_progress_summary = progress_state.summary()
-                _ingest_policy_proxy_observability(trial)
                 _ingest_agent_trajectory_observability(trial)
 
         stop_reason = _stop_reason_from_result(result)
@@ -1738,17 +1212,11 @@ async def _run_harbor_trial(
                 result=result,
                 stop_reason=stop_reason,
                 error_message=None,
-                progress_summary=last_progress_summary,
             )
 
         rollout_details = None
         if result.agent_result is not None:
             rollout_details = result.agent_result.rollout_details
-        if not rollout_details and "policy_proxy" in sandbox_config["integration"]["kwargs"]:
-            trace_file = sandbox_config["integration"]["kwargs"]["policy_proxy"]["trace_file"]
-            trace_path = trial._trial_paths.agent_dir / trace_file
-            if trace_path.exists():
-                rollout_details = load_policy_trace_jsonl(trace_path)
 
         if not rollout_details:
             last_error_message = f"Harbor trial {result.trial_name} did not produce rollout_details"
@@ -1779,7 +1247,6 @@ async def _run_harbor_trial(
                 rewards,
                 stop_reason=stop_reason,
                 attempt_idx=attempt_idx,
-                progress_summary=last_progress_summary,
             ),
             "agent_name": result.agent_info.name,
             "truncated": result.exception_info is not None,
@@ -1799,7 +1266,6 @@ async def _run_harbor_trial(
         result=result,
         stop_reason=stop_reason,
         error_message=last_error_message,
-        progress_summary=last_progress_summary,
     )
 
 
@@ -1848,39 +1314,6 @@ def _prompt_group_id(row: dict[str, Any], row_idx: int) -> Any:
     if "idx" in row:
         return row["idx"]
     return json.dumps(row, sort_keys=True, default=str)
-
-
-@contextmanager
-def _temporary_process_env(env: dict[str, str]) -> Iterator[None]:
-    old_values: dict[str, str | None] = {key: os.environ.get(key) for key in env}
-    os.environ.update(env)
-    try:
-        yield
-    finally:
-        for key, old_value in old_values.items():
-            if old_value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = old_value
-
-
-def _policy_proxy_process_env(
-    integration_kwargs: dict[str, Any],
-    context: SandboxRolloutContext,
-) -> dict[str, str]:
-    policy_proxy = integration_kwargs.get("policy_proxy", None)
-    if not isinstance(policy_proxy, dict):
-        return {}
-    proxy_env = policy_proxy.get("env", None)
-    if not isinstance(proxy_env, dict):
-        return {}
-    format_values = {
-        "model_name": context.model_name,
-        "target_base_url": _first_policy_base_url(context),
-        "proxy_root_url": f"http://127.0.0.1:{policy_proxy['port']}",
-        "proxy_base_url": f"http://127.0.0.1:{policy_proxy['port']}/v1",
-    }
-    return {key: str(_format_config_value(value, format_values)) for key, value in proxy_env.items()}
 
 
 def _mask_failed_prompt_groups(
@@ -2261,10 +1694,9 @@ def collect_harbor_trajectories(
             return _mask_failed_prompt_groups(trajectories, rows)
         return trajectories
 
-    with _temporary_process_env(_policy_proxy_process_env(integration_kwargs, context)):
-        try:
-            with use_recorder(owned_recorder):
-                return asyncio.run(_collect())
-        finally:
-            if owned_recorder is not None:
-                owned_recorder.finalize()
+    try:
+        with use_recorder(owned_recorder):
+            return asyncio.run(_collect())
+    finally:
+        if owned_recorder is not None:
+            owned_recorder.finalize()

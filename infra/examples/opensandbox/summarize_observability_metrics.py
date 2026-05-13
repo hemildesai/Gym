@@ -237,34 +237,6 @@ def summarize(observability_dir: Path, *, rollouts: Path | None = None) -> dict[
         "sandbox_setup_s": _duration_stats(events, name="sandbox.setup"),
         "sandbox_borrow_setup_s": _duration_stats(events, name="sandbox.borrow.setup"),
         "sandbox_prewarm_setup_s": _duration_stats(events, name="sandbox.prewarm.setup"),
-        "sandbox_policy_proxy_start_s": _duration_stats(
-            events,
-            name="sandbox.policy_proxy.start",
-        ),
-        "sandbox_policy_proxy_prewarm_start_s": _duration_stats(
-            events,
-            name="sandbox.policy_proxy.prewarm_start",
-        ),
-        "sandbox_policy_proxy_start_success_s": _duration_stats(
-            events,
-            name="sandbox.policy_proxy.start",
-            status="ok",
-        ),
-        "sandbox_policy_proxy_start_error_s": _duration_stats(
-            events,
-            name="sandbox.policy_proxy.start",
-            status="error",
-        ),
-        "sandbox_policy_proxy_prewarm_start_success_s": _duration_stats(
-            events,
-            name="sandbox.policy_proxy.prewarm_start",
-            status="ok",
-        ),
-        "sandbox_policy_proxy_prewarm_start_error_s": _duration_stats(
-            events,
-            name="sandbox.policy_proxy.prewarm_start",
-            status="error",
-        ),
         "sandbox_upload_environment_s": _duration_stats(
             events,
             name="sandbox.setup.upload_environment",
@@ -298,34 +270,12 @@ def summarize(observability_dir: Path, *, rollouts: Path | None = None) -> dict[
             "environment_setup": durations["sandbox_setup_s"],
             "borrow_setup": durations["sandbox_borrow_setup_s"],
             "prewarm_setup": durations["sandbox_prewarm_setup_s"],
-            "policy_proxy_start": durations["sandbox_policy_proxy_start_s"],
-            "policy_proxy_prewarm_start": durations[
-                "sandbox_policy_proxy_prewarm_start_s"
-            ],
-            "policy_proxy_start_success": durations[
-                "sandbox_policy_proxy_start_success_s"
-            ],
-            "policy_proxy_start_error": durations[
-                "sandbox_policy_proxy_start_error_s"
-            ],
-            "policy_proxy_prewarm_start_success": durations[
-                "sandbox_policy_proxy_prewarm_start_success_s"
-            ],
-            "policy_proxy_prewarm_start_error": durations[
-                "sandbox_policy_proxy_prewarm_start_error_s"
-            ],
             "upload_environment": durations["sandbox_upload_environment_s"],
             "description": {
                 "sandbox_readiness": "OpenSandbox allocation through first successful sandbox start probe.",
                 "environment_setup": "Harbor/Gym environment bootstrap after the sandbox is reachable.",
                 "borrow_setup": "Rollout-path Harbor environment reset/upload/setup after borrowing a prewarmed handle.",
                 "prewarm_setup": "Pre-rollout Harbor environment reset/upload/setup performed against idle pool handles.",
-                "policy_proxy_start": "Rollout-path policy proxy startup inside the sandbox.",
-                "policy_proxy_prewarm_start": "Pre-rollout policy proxy startup inside the sandbox.",
-                "policy_proxy_start_success": "Success-only rollout-path policy proxy startup.",
-                "policy_proxy_start_error": "Error-only rollout-path policy proxy startup.",
-                "policy_proxy_prewarm_start_success": "Success-only pre-rollout policy proxy startup.",
-                "policy_proxy_prewarm_start_error": "Error-only pre-rollout policy proxy startup.",
                 "upload_environment": "Upload of task environment files into the sandbox.",
                 "opensandbox_create_api": "OpenSandbox SDK/API create wait before NeMo-RL's explicit probe.",
                 "first_exec_probe": "NeMo-RL verification command proving execd is reachable.",

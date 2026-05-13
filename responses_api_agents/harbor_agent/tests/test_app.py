@@ -1037,29 +1037,14 @@ class TestBuildJobConfig:
 
         assert agent["override_setup_timeout_sec"] == 1800.0
 
-    def test_policy_proxy_config_for_installed_agent(self) -> None:
+    def test_installed_agent_config_uses_direct_model_env(self) -> None:
         server = _make_server(
             harbor_agent_name="mini-swe-agent",
             harbor_agent_import_path=None,
             harbor_agent_model_name="openai/{model_name}",
-            harbor_policy_proxy={
-                "port": 8765,
-                "trace_file": "policy_trace.jsonl",
-                "script_path": "/tmp/nemo_rl_policy_proxy.py",
-                "backend": "stdlib",
-                "litellm_provider": "openai",
-                "upstream_model_name": "{model_name}",
-                "responses_upstream_api": "responses",
-                "generation_temperature": 0.6,
-                "generation_top_p": 0.95,
-                "generation_top_k": 20,
-                "generation_chat_template_kwargs": {"enable_thinking": True},
-                "force_generation_params": True,
-                "env": {
-                    "OPENAI_BASE_URL": "{proxy_base_url}",
-                    "OPENAI_API_BASE": "{proxy_base_url}",
-                    "OPENAI_API_KEY": "sandbox-proxy",
-                },
+            harbor_agent_env={
+                "OPENAI_BASE_URL": "http://policy:8000/v1",
+                "OPENAI_API_KEY": "dummy",
             },
         )
 
@@ -1076,11 +1061,8 @@ class TestBuildJobConfig:
 
         agent = job_config["agents"][0]
         environment_kwargs = job_config["environment"]["kwargs"]
-        policy_proxy = environment_kwargs["policy_proxy"]
 
         assert agent["model_name"] == "openai/Qwen/Qwen3.5-27B"
-        assert agent["env"]["OPENAI_BASE_URL"] == "http://127.0.0.1:8765/v1"
-        assert policy_proxy["target_base_url"] == "http://real-policy:8000/v1"
-        assert policy_proxy["trace_path"] == "/logs/agent/policy_trace.jsonl"
-        assert policy_proxy["upstream_model_name"] == "Qwen/Qwen3.5-27B"
-        assert policy_proxy["generation_chat_template_kwargs"] == {"enable_thinking": True}
+        assert agent["env"]["OPENAI_BASE_URL"] == "http://policy:8000/v1"
+        assert agent["env"]["OPENAI_API_KEY"] == "dummy"
+        assert "policy_proxy" not in environment_kwargs

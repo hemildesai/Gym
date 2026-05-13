@@ -7,7 +7,7 @@ harbor_agent:
       value: Evaluate SWE-bench with the installed mini-swe-agent v2 harness.
       concurrency: 128
       runner_backend: async
-      response_output_mode: policy_trace
+      response_output_mode: trajectory
 
       harbor_datasets:
         swebench:
@@ -20,27 +20,6 @@ harbor_agent:
       harbor_agent_kwargs:
         cost_limit: "3"
         config_file: ${oc.env:MINI_SWE_CONFIG_PATH,responses_api_agents/harbor_agent/configs/mini_swe_agent_responses_swebench.yaml}
-
-      harbor_policy_proxy:
-        port: 8765
-        trace_file: policy_trace.jsonl
-        script_path: /tmp/nemo_gym_policy_proxy.py
-        backend: stdlib
-        litellm_provider: openai
-        upstream_model_name: "{model_name}"
-        responses_upstream_api: responses
-        generation_temperature: 0.6
-        generation_top_p: 0.95
-        generation_top_k: 20
-        generation_chat_template_kwargs:
-          enable_thinking: true
-        force_generation_params: true
-        env:
-          MSWEA_API_KEY: sandbox-proxy
-          OPENAI_API_KEY: sandbox-proxy
-          OPENAI_BASE_URL: "{proxy_base_url}"
-          OPENAI_API_BASE: "{proxy_base_url}"
-          PYTHONPATH: /tmp
 
       harbor_environment_type: null
       harbor_environment_import_path: responses_api_agents.harbor_agent.sandbox:SandboxHarborEnvironment

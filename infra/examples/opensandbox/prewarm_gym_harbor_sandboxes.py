@@ -18,10 +18,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections import Counter
 import json
-from pathlib import Path
 import time
+from collections import Counter
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -138,7 +138,6 @@ async def _prewarm(args: argparse.Namespace) -> dict[str, Any]:
                 "prepare_concurrency": args.prepare_concurrency,
                 "replace_existing": args.replace_existing and attempt == 0,
                 "prepare_environment": args.prepare_environment,
-                "start_policy_proxy": args.start_policy_proxy,
             },
             head_host=args.head_host,
             head_port=args.head_port,
@@ -213,11 +212,6 @@ def _parse_args() -> argparse.Namespace:
     prewarm.add_argument("--retry-max-delay-s", type=float, default=60.0)
     prewarm.add_argument(
         "--prepare-environment",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
-    prewarm.add_argument(
-        "--start-policy-proxy",
         action=argparse.BooleanOptionalAction,
         default=None,
     )
