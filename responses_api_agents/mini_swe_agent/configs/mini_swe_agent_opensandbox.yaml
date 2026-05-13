@@ -16,7 +16,7 @@ mini_swe_simple_agent:
           repo_id: princeton-nlp/SWE-bench_Verified
         license: MIT
       concurrency: 64
-      env: opensandbox
+      env: sandbox
       cache_dir_template: null
       sandbox_provider:
         name: opensandbox
@@ -25,7 +25,6 @@ mini_swe_simple_agent:
           api_key: ${oc.env:OPENSANDBOX_API_KEY}
           protocol: http
           use_server_proxy: true
-          batch_mode: sdk
           batch_create_concurrency: 128
           batch_create_retries: 10
           batch_create_retry_delay_s: 5.0

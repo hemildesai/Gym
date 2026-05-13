@@ -16,10 +16,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 import json
-from pathlib import Path
 import re
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from nemo_gym.sandbox.observability.events import command_attributes, stable_hash
@@ -198,8 +198,7 @@ def _spans_from_atif_steps(
 ) -> list[dict[str, Any]]:
     spans: list[dict[str, Any]] = []
     timestamp_by_index = [
-        _timestamp_value(step.get("timestamp")) if isinstance(step, dict) else None
-        for step in steps
+        _timestamp_value(step.get("timestamp")) if isinstance(step, dict) else None for step in steps
     ]
     tool_index = 0
     for index, step in enumerate(steps):

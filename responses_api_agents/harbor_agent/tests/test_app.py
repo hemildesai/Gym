@@ -12,7 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
+import shlex
 import sys
 import tempfile
 from asyncio import Semaphore
@@ -22,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, List, Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -31,6 +33,9 @@ from responses_api_agents.harbor_agent.app import (
     HarborAgent,
     HarborAgentConfig,
     HarborRunRequest,
+    HarborSandboxCleanupRequest,
+    HarborSandboxPrewarmItem,
+    HarborSandboxPrewarmRequest,
     _run_harbor_job_sync,
     _run_harbor_job_with_backend,
 )
@@ -112,6 +117,64 @@ def _bash_tool_call(call_id: str, keystrokes: str, duration: float = 0.1) -> Dic
 
 def _raw_msg(analysis: str, plan: str, commands: list, task_complete: bool = False) -> str:
     return json.dumps({"analysis": analysis, "plan": plan, "commands": commands, "task_complete": task_complete})
+
+
+def test_gym_tmux_session_terminates_send_keys_options(tmp_path):
+    module = pytest.importorskip("responses_api_agents.harbor_agent.custom_agents.terminus_2_nemo_gym")
+    GymTmuxSession = module.GymTmuxSession
+    session = GymTmuxSession(
+        session_name="test-session",
+        environment=MagicMock(),
+        logging_path=tmp_path / "tmux.log",
+        local_asciinema_recording_path=None,
+        remote_asciinema_recording_path=None,
+    )
+
+    commands = session._tmux_send_keys(["--flag-looking-text", "Enter"])
+
+    assert len(commands) == 2
+    assert "tmux load-buffer" in commands[0]
+    assert "tmux paste-buffer" in commands[0]
+    assert "--flag-looking-text" not in commands[0]
+    assert shlex.split(commands[1]) == ["tmux", "send-keys", "-t", "test-session", "Enter"]
+
+
+def test_gym_tmux_session_uses_root_cwd_for_tmux_control(tmp_path):
+    module = pytest.importorskip("responses_api_agents.harbor_agent.custom_agents.terminus_2_nemo_gym")
+    GymTmuxSession = module.GymTmuxSession
+
+    class FakeExecResult:
+        stdout = "ok"
+        stderr = ""
+        return_code = 0
+
+    class FakeEnvironment:
+        session_id = "fake-session"
+
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def exec(self, command: str, **kwargs: Any) -> FakeExecResult:
+            self.calls.append({"command": command, **kwargs})
+            return FakeExecResult()
+
+    environment = FakeEnvironment()
+    session = GymTmuxSession(
+        session_name="test-session",
+        environment=environment,
+        logging_path=tmp_path / "tmux.log",
+        local_asciinema_recording_path=None,
+        remote_asciinema_recording_path=None,
+        user="sandbox",
+    )
+
+    asyncio.run(session._send_non_blocking_keys(["--flag-looking-text"], 0.0))
+    asyncio.run(session.capture_pane(capture_entire=True))
+    asyncio.run(session.is_session_alive())
+
+    assert environment.calls
+    assert all(call["cwd"] == "/" for call in environment.calls)
+    assert all(call["user"] == "sandbox" for call in environment.calls)
 
 
 # ---------------------------------------------------------------------------
@@ -280,13 +343,16 @@ def _harbor_run_mocks(
     """Patch external deps and wire up mocks for HarborAgent.run()."""
     with (
         patch("responses_api_agents.harbor_agent.app.get_global_config_dict") as mock_gc,
-        patch("responses_api_agents.harbor_agent.app.runner_ray_remote") as mock_ray,
+        patch("responses_api_agents.harbor_agent.app._get_ray") as mock_get_ray,
+        patch("responses_api_agents.harbor_agent.app._get_runner_ray_remote") as mock_get_ray_remote,
         patch("asyncio.to_thread") as mock_to_thread,
         patch.object(HarborAgent, "_build_job_config", return_value={"job_name": "mock_job"}),
     ):
         mock_gc.return_value = _GLOBAL_CONFIG
-        mock_ray.remote.return_value = MagicMock()
-        mock_ray.options.return_value.remote.return_value = MagicMock()
+        mock_get_ray.return_value.get = MagicMock()
+        mock_ray_remote = MagicMock()
+        mock_ray_remote.options.return_value.remote.return_value = MagicMock()
+        mock_get_ray_remote.return_value = mock_ray_remote
 
         if side_effect:
             mock_to_thread.side_effect = side_effect
@@ -345,13 +411,142 @@ def _fake_harbor_config_modules():
         yield
 
 
+class _BlockingPrewarmProvider:
+    def __init__(self) -> None:
+        self.call_count = 0
+        self.two_calls_started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def create_batch(self, spec: str, count: int, *, allow_partial: bool = False) -> list[str]:
+        assert not allow_partial
+        self.call_count += 1
+        if self.call_count >= 2:
+            self.two_calls_started.set()
+        await self.release.wait()
+        return [f"{spec}-{index}" for index in range(count)]
+
+
+class TestSandboxPoolPrewarm:
+    async def test_non_replacing_prewarm_requests_can_overlap(self) -> None:
+        server = _make_server(
+            concurrency=2,
+            sandbox_pool={"enabled": True},
+            harbor_environment_kwargs={"provider": {"type": "opensandbox"}},
+        )
+        provider = _BlockingPrewarmProvider()
+
+        def register_handle(key: str, token: str, handle: Any, **_: Any) -> None:
+            server._sandbox_pool_idle_tokens[key] = token
+            server._sandbox_pool_handles[token] = handle
+
+        with (
+            patch.object(server, "_create_sandbox_pool_provider", return_value=provider),
+            patch.object(server, "_build_sandbox_pool_spec", side_effect=lambda instance_id: instance_id),
+            patch.object(server, "_register_prewarmed_handle", side_effect=register_handle),
+        ):
+            first = asyncio.create_task(
+                server.prewarm_sandboxes(
+                    HarborSandboxPrewarmRequest(
+                        items=[HarborSandboxPrewarmItem(instance_id="scientific::task-a", task_index=0)]
+                    )
+                )
+            )
+
+            while provider.call_count < 1:
+                await asyncio.sleep(0)
+
+            second = asyncio.create_task(
+                server.prewarm_sandboxes(
+                    HarborSandboxPrewarmRequest(
+                        items=[HarborSandboxPrewarmItem(instance_id="scientific::task-b", task_index=1)]
+                    )
+                )
+            )
+            await asyncio.wait_for(provider.two_calls_started.wait(), timeout=1)
+            assert server._sandbox_pool_prewarm_inflight == 2
+
+            provider.release.set()
+            first_result, second_result = await asyncio.gather(first, second)
+
+        assert first_result["created"] == 1
+        assert second_result["created"] == 1
+        assert server._sandbox_pool_prewarm_inflight == 0
+        assert len(server._sandbox_pool_idle_tokens) == 2
+
+    async def test_replacing_prewarm_still_blocks_during_inflight_prewarm(self) -> None:
+        server = _make_server(
+            concurrency=2,
+            sandbox_pool={"enabled": True},
+            harbor_environment_kwargs={"provider": {"type": "opensandbox"}},
+        )
+        provider = _BlockingPrewarmProvider()
+
+        with (
+            patch.object(server, "_create_sandbox_pool_provider", return_value=provider),
+            patch.object(server, "_build_sandbox_pool_spec", side_effect=lambda instance_id: instance_id),
+        ):
+            first = asyncio.create_task(
+                server.prewarm_sandboxes(
+                    HarborSandboxPrewarmRequest(
+                        items=[HarborSandboxPrewarmItem(instance_id="scientific::task-a", task_index=0)]
+                    )
+                )
+            )
+
+            while provider.call_count < 1:
+                await asyncio.sleep(0)
+
+            with pytest.raises(RuntimeError, match="Sandbox prewarm is already running"):
+                await server.prewarm_sandboxes(
+                    HarborSandboxPrewarmRequest(
+                        items=[HarborSandboxPrewarmItem(instance_id="scientific::task-b", task_index=1)],
+                        replace_existing=True,
+                    )
+                )
+
+            provider.release.set()
+            await first
+
+    async def test_cleanup_prewarmed_sandboxes_is_best_effort(self) -> None:
+        server = _make_server(
+            concurrency=2,
+            sandbox_pool={"enabled": True},
+            harbor_environment_kwargs={"provider": {"type": "opensandbox"}},
+        )
+        token = "token-1"
+        server._sandbox_pool_provider = object()
+        server._sandbox_pool_idle_tokens["0:0:scientific::task-a"] = token
+        server._sandbox_pool_handles[token] = {"sandbox_id": "gone"}
+
+        with (
+            patch.object(
+                server,
+                "_sandbox_pool_materialize_handle",
+                side_effect=RuntimeError("sandbox already deleted"),
+            ),
+            patch(
+                "responses_api_agents.harbor_agent.sandbox._close_provider_resources",
+                new=AsyncMock(side_effect=RuntimeError("transport already closed")),
+            ),
+        ):
+            result = await server.cleanup_prewarmed_sandboxes(HarborSandboxCleanupRequest())
+
+        assert result["cleaned"] == 1
+        assert result["snapshot"]["idle"] == 0
+        assert server._sandbox_pool_provider is None
+        assert server._sandbox_pool_handles == {}
+        assert server._sandbox_pool_idle_tokens == {}
+
+
 class TestRunnerBackend:
     async def test_async_backend_runs_without_thread_or_ray(self) -> None:
         with (
             patch("responses_api_agents.harbor_agent.app.run_harbor_job") as mock_run,
-            patch("responses_api_agents.harbor_agent.app.runner_ray_remote") as mock_ray,
+            patch("responses_api_agents.harbor_agent.app._get_ray") as mock_get_ray,
+            patch("responses_api_agents.harbor_agent.app._get_runner_ray_remote") as mock_get_ray_remote,
         ):
             mock_run.return_value = "/tmp/trial"
+            mock_get_ray.side_effect = AssertionError("async backend must not import ray")
 
             trial_dir = await _run_harbor_job_with_backend(
                 backend="async",
@@ -361,15 +556,18 @@ class TestRunnerBackend:
 
         assert trial_dir == "/tmp/trial"
         mock_run.assert_awaited_once_with({"job_name": "mock_job"})
-        mock_ray.options.assert_not_called()
+        mock_get_ray.assert_not_called()
+        mock_get_ray_remote.assert_not_called()
 
     async def test_thread_backend_runs_without_ray_worker(self) -> None:
         with (
             ThreadPoolExecutor(max_workers=1) as executor,
             patch("responses_api_agents.harbor_agent.app._run_harbor_job_sync") as mock_sync,
-            patch("responses_api_agents.harbor_agent.app.runner_ray_remote") as mock_ray,
+            patch("responses_api_agents.harbor_agent.app._get_ray") as mock_get_ray,
+            patch("responses_api_agents.harbor_agent.app._get_runner_ray_remote") as mock_get_ray_remote,
         ):
             mock_sync.return_value = "/tmp/trial"
+            mock_get_ray.side_effect = AssertionError("thread backend must not import ray")
 
             trial_dir = await _run_harbor_job_with_backend(
                 backend="thread",
@@ -380,16 +578,21 @@ class TestRunnerBackend:
 
         assert trial_dir == "/tmp/trial"
         mock_sync.assert_called_once_with({"job_name": "mock_job"})
-        mock_ray.options.assert_not_called()
+        mock_get_ray.assert_not_called()
+        mock_get_ray_remote.assert_not_called()
 
     async def test_ray_backend_uses_bounded_ray_options(self) -> None:
         future = MagicMock()
         with (
             patch("responses_api_agents.harbor_agent.app.asyncio.to_thread") as mock_to_thread,
-            patch("responses_api_agents.harbor_agent.app.runner_ray_remote") as mock_ray,
-            patch("responses_api_agents.harbor_agent.app.ray.get") as mock_ray_get,
+            patch("responses_api_agents.harbor_agent.app._get_ray") as mock_get_ray,
+            patch("responses_api_agents.harbor_agent.app._get_runner_ray_remote") as mock_get_ray_remote,
         ):
+            mock_ray = MagicMock()
             mock_ray.options.return_value.remote.return_value = future
+            mock_ray_get = MagicMock()
+            mock_get_ray.return_value.get = mock_ray_get
+            mock_get_ray_remote.return_value = mock_ray
             mock_to_thread.return_value = "/tmp/trial"
 
             trial_dir = await _run_harbor_job_with_backend(
@@ -399,6 +602,8 @@ class TestRunnerBackend:
             )
 
         assert trial_dir == "/tmp/trial"
+        mock_get_ray.assert_called_once_with()
+        mock_get_ray_remote.assert_called_once_with()
         mock_ray.options.assert_called_once_with(num_cpus=0.25)
         mock_ray.options.return_value.remote.assert_called_once_with(
             _run_harbor_job_sync,
@@ -413,6 +618,13 @@ class TestRunnerBackend:
 
 
 class TestApp:
+    def test_setup_webserver_includes_core_agent_routes(self):
+        server = _make_server()
+
+        routes = {route.path for route in server.setup_webserver().routes}
+
+        assert {"/run", "/v1/responses", "/aggregate_metrics"}.issubset(routes)
+
     async def test_run_with_token_details(self):
         server = _make_server()
         with _harbor_run_mocks(trajectory=DEFAULT_TRAJECTORY):

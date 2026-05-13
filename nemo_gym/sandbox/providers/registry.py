@@ -19,6 +19,7 @@ from typing import TypeAlias
 from nemo_gym.sandbox.config import SandboxProviderConfig
 from nemo_gym.sandbox.providers.base import SandboxProvider
 
+
 ProviderClass: TypeAlias = type[SandboxProvider]
 
 G_PROVIDER_REGISTRY: dict[str, ProviderClass] = {}
@@ -39,9 +40,7 @@ def get_provider_class(name: str) -> ProviderClass:
         return G_PROVIDER_REGISTRY[name]
     except KeyError as e:
         available = ", ".join(sorted(G_PROVIDER_REGISTRY)) or "<none>"
-        raise ValueError(
-            f"Unknown sandbox provider {name!r}. Available providers: {available}"
-        ) from e
+        raise ValueError(f"Unknown sandbox provider {name!r}. Available providers: {available}") from e
 
 
 def create_provider(config: SandboxProviderConfig) -> SandboxProvider:

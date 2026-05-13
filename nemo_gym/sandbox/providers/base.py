@@ -15,7 +15,8 @@
 """Provider-facing sandbox protocol.
 
 Providers are the only layer that talks to runtime and infrastructure APIs.
-Harbor, NeMo Gym, and other harnesses sit under ``nemo_gym.sandbox.integrations``.
+Gym agents and external harnesses consume the public ``nemo_gym.sandbox`` API
+instead of importing provider-specific modules.
 """
 
 from dataclasses import dataclass, field
@@ -59,8 +60,16 @@ class SandboxExecResult:
     return_code: int
 
 
+class SandboxBatchCreateError(RuntimeError):
+    """Raised when a provider cannot complete sandbox batch creation."""
+
+
+class SandboxCreateVerificationError(ConnectionError):
+    """Raised when a newly-created sandbox fails provider readiness checks."""
+
+
 class SandboxProvider(Protocol):
-    """Runtime/infra provider contract used by sandbox integrations."""
+    """Runtime/infra provider contract used by the public sandbox API."""
 
     name: str
 
@@ -102,9 +111,7 @@ class SandboxProvider(Protocol):
         """Run a command inside a sandbox."""
         ...
 
-    async def write_file(
-        self, handle: SandboxHandle, target_path: str, data: str | bytes
-    ) -> None:
+    async def write_file(self, handle: SandboxHandle, target_path: str, data: str | bytes) -> None:
         """Write a file into a sandbox."""
         ...
 
@@ -112,15 +119,11 @@ class SandboxProvider(Protocol):
         """Read a file from a sandbox."""
         ...
 
-    async def upload_file(
-        self, handle: SandboxHandle, source_path: Path, target_path: str
-    ) -> None:
+    async def upload_file(self, handle: SandboxHandle, source_path: Path, target_path: str) -> None:
         """Upload one local file into a sandbox."""
         ...
 
-    async def download_file(
-        self, handle: SandboxHandle, source_path: str, target_path: Path
-    ) -> None:
+    async def download_file(self, handle: SandboxHandle, source_path: str, target_path: Path) -> None:
         """Download one sandbox file to the local filesystem."""
         ...
 

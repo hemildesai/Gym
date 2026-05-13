@@ -16,8 +16,8 @@
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
 import json
+from collections import Counter, defaultdict
 from pathlib import Path
 from statistics import mean
 from typing import Any, Iterable
@@ -114,9 +114,7 @@ def summarize_observability(output_dir: Path) -> dict[str, Any]:
             stop_reasons[str(attrs.get("stop_reason") or "masked")] += 1
 
     memory_values = [
-        int(sample["memory_usage_bytes"])
-        for sample in resources
-        if isinstance(sample.get("memory_usage_bytes"), int)
+        int(sample["memory_usage_bytes"]) for sample in resources if isinstance(sample.get("memory_usage_bytes"), int)
     ]
     cpu_values = [
         float(sample["cpu_utilization"])
@@ -124,21 +122,15 @@ def summarize_observability(output_dir: Path) -> dict[str, Any]:
         if isinstance(sample.get("cpu_utilization"), (int, float))
     ]
     process_counts = [
-        int(sample["process_count"])
-        for sample in resources
-        if isinstance(sample.get("process_count"), int)
+        int(sample["process_count"]) for sample in resources if isinstance(sample.get("process_count"), int)
     ]
 
     return {
         "schema_version": 1,
         "events_count": len(events),
         "resource_samples_count": len(resources),
-        "durations_by_name": {
-            name: _stats(values) for name, values in sorted(durations_by_name.items())
-        },
-        "durations_by_phase": {
-            phase: _stats(values) for phase, values in sorted(durations_by_phase.items())
-        },
+        "durations_by_name": {name: _stats(values) for name, values in sorted(durations_by_name.items())},
+        "durations_by_phase": {phase: _stats(values) for phase, values in sorted(durations_by_phase.items())},
         "stop_reasons": dict(sorted(stop_reasons.items())),
         "errors": dict(sorted(errors.items())),
         "reward": _stats(rewards),

@@ -25,7 +25,6 @@ manifest: `GYM_DIR`, `HARBOR_DIR`, `OPENSANDBOX_PYTHON_DIR`,
 ## Launch SWE-bench Smoke Eval
 
 ```bash
-kubectl apply -f infra/examples/opensandbox/batchsandbox-rbac.yaml
 kubectl create -f infra/examples/opensandbox/gym-harbor-mini-swe-eval-job.yaml
 ```
 
@@ -33,7 +32,7 @@ The default manifest runs a two-task smoke eval with:
 
 - `NEMO_GYM_RAY_ENABLED=false`, so the coordinator can run without Ray startup.
 - Direct model routing through `POLICY_BASE_URL`.
-- OpenSandbox `batchsandbox` mode.
+- OpenSandbox SDK/server-proxy sandbox routing through the unified Gym sandbox API.
 - Client-side Gym sandbox prewarm enabled with `fail_fast` acquire policy.
 - W&B disabled by default; set `NEMO_RL_SANDBOX_OBSERVABILITY_WANDB=1` and
   provide an optional `wandb-api-key` secret to upload observability data.
@@ -44,8 +43,8 @@ To scale beyond smoke, patch `TASK_LIMIT`, `CONCURRENCY`,
 ## Optional OpenSandbox Pool CR Warm Starts
 
 The eval job can run with client-side prewarm alone, which creates
-BatchSandbox-backed handles before rollout collection. For exact per-task
-OpenSandbox Pool CR warm starts, set:
+SDK-backed handles before rollout collection. For exact per-task OpenSandbox
+Pool CR warm starts, set:
 
 ```yaml
 - name: OPENSANDBOX_GENERATE_HARBOR_TASK_POOLS
@@ -58,21 +57,18 @@ The job will generate task-specific Pool manifests from `HARBOR_TASKS_DIR`,
 ensure them through the OpenSandbox API, and route sandboxes with
 `swefastghcr-{task_name}-pool`.
 
-Static sample Pool and BatchSandbox manifests are included for smoke testing and
-cluster setup:
+Static sample Pool manifests are included for smoke testing and cluster setup:
 
 - `swe-agent-pool.yaml`
 - `swe-agent-arch-pools.yaml`
 - `swebench-astropy-pool.yaml`
 - `tbench-adaptive-rejection-sampler-pool.yaml`
-- `batchsandbox-scale-smoke.yaml`
-- `batchsandbox-template-cpu-affinity.yaml`
 
 ## Helper Scripts
 
 - `prepare_gym_tbench_input.py`: builds Gym rollout JSONL input from Harbor task dirs.
 - `prewarm_gym_harbor_sandboxes.py`: calls the Harbor agent prewarm and cleanup APIs.
 - `generate_harbor_task_pools.py`: emits per-task OpenSandbox Pool CRs.
-- `manage_opensandbox_job_resources.py`: ensures and cleans up OpenSandbox Pools and BatchSandboxes.
+- `manage_opensandbox_job_resources.py`: ensures and cleans up OpenSandbox Pools.
 - `verify_gym_rollouts.py`, `summarize_gym_rollouts.py`, and
   `summarize_harbor_trajectory_timing.py`: post-run validation and summaries.

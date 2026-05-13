@@ -1,48 +1,52 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-# http://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""mini-swe-agent environment backed by the NeMo-RL sandbox provider API."""
+
+"""mini-swe-agent environment adapter backed by the Gym sandbox API."""
 
 import asyncio
-from concurrent.futures import TimeoutError as FutureTimeoutError
-from dataclasses import dataclass, field
 import os
 import shlex
 import threading
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from dataclasses import dataclass, field
 from typing import Any
+
+from nemo_gym.sandbox import Sandbox, SandboxSpec, rewrite_image
+from nemo_gym.sandbox.config import SandboxProviderConfig
 
 
 @dataclass
-class OpenSandboxMiniSWEEnvironmentConfig:
+class MiniSWESandboxEnvironmentConfig:
+    """Configuration for mini-swe-agent runs inside a sandbox."""
+
     image: str
-    cwd: str = "/testbed"
+    cwd: str = "/workspace"
     env: dict[str, str] = field(default_factory=dict)
     forward_env: list[str] = field(default_factory=list)
     step_timeout: int = 600
     eval_timeout: int = 1800
     instance_id: str | None = None
-    provider: dict[str, Any] = field(default_factory=dict)
+    provider: SandboxProviderConfig | dict[str, Any] = field(default_factory=dict)
     spec: dict[str, Any] = field(default_factory=dict)
-    conda_env: str | None = "testbed"
-    activate_conda: bool = True
+    conda_env: str | None = None
+    activate_conda: bool = False
     user: str | int | None = "root"
     delete: bool = True
-    cache_dir_template: str | None = None
 
 
 class _AsyncLoopRunner:
-    """Own one event loop for all async provider calls in this sync adapter."""
+    """Own one event loop for async provider calls used by sync harnesses."""
 
     def __init__(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -72,38 +76,22 @@ class _AsyncLoopRunner:
         self._loop.close()
 
 
-def _rewrite_image(image: str, rewrites: list[dict[str, str]]) -> str:
-    for rewrite in rewrites:
-        from_prefix = rewrite["from"]
-        to_prefix = rewrite["to"]
-        if image.startswith(from_prefix):
-            return to_prefix + image[len(from_prefix) :]
-    return image
-
-
-class OpenSandboxMiniSWEEnvironment:
-    """Sync mini-swe-agent environment using ``SandboxProvider`` / ``SandboxSpec``.
-
-    mini-swe-agent expects a small synchronous object with ``execute`` and
-    ``cleanup`` methods. The provider remains async underneath; this adapter
-    bridges that boundary without introducing another runtime provider layer.
-    """
+class MiniSWESandboxEnvironment:
+    """mini-swe-agent sync environment implemented with ``nemo_gym.sandbox.Sandbox``."""
 
     def __init__(
         self,
         *,
-        config_class: type = OpenSandboxMiniSWEEnvironmentConfig,
+        config_class: type = MiniSWESandboxEnvironmentConfig,
         **kwargs: Any,
     ) -> None:
-        from nemo_gym.sandbox.providers import SandboxSpec, create_provider
-
         self.config = config_class(**kwargs)
         if not self.config.provider:
-            raise ValueError("OpenSandbox mini-swe-agent environment requires provider")
+            raise ValueError("MiniSWESandboxEnvironment requires provider")
 
         spec_config = dict(self.config.spec)
         image = spec_config.pop("image", None) or self.config.image
-        image = _rewrite_image(image, spec_config.pop("image_rewrites", []))
+        image = rewrite_image(image, spec_config.pop("image_rewrites", []))
 
         env = dict(spec_config.pop("env", {}))
         for key in self.config.forward_env:
@@ -113,9 +101,9 @@ class OpenSandboxMiniSWEEnvironment:
         env.update(self.config.env)
 
         self._loop_runner = _AsyncLoopRunner()
-        self._provider = create_provider(self.config.provider)
+        self._sandbox = Sandbox(self.config.provider)
         self._handle = self._loop_runner.run(
-            self._provider.create(
+            self._sandbox.create(
                 SandboxSpec(
                     image=image,
                     snapshot_id=spec_config.pop("snapshot_id", None),
@@ -167,7 +155,7 @@ class OpenSandboxMiniSWEEnvironment:
         timeout_s = self.config.eval_timeout if is_eval else self.config.step_timeout
         exec_cwd = cwd or self.config.cwd
         result = self._loop_runner.run(
-            self._provider.exec(
+            self._sandbox.exec(
                 self._handle,
                 self._command(command, exec_cwd),
                 cwd="/",
@@ -187,14 +175,12 @@ class OpenSandboxMiniSWEEnvironment:
             return
         self._closed = True
         try:
-            self._loop_runner.run(self._provider.close(self._handle, delete=self.config.delete))
-            aclose = getattr(self._provider, "aclose", None)
-            if aclose is not None:
-                self._loop_runner.run(aclose())
+            self._loop_runner.run(self._sandbox.close(self._handle, delete=self.config.delete))
+            self._loop_runner.run(self._sandbox.aclose())
         finally:
             self._loop_runner.close()
 
-    def __enter__(self) -> "OpenSandboxMiniSWEEnvironment":
+    def __enter__(self) -> "MiniSWESandboxEnvironment":
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:

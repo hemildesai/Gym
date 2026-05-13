@@ -46,7 +46,7 @@ spec:
     spec:
       restartPolicy: Never
       schedulerName: default-scheduler
-      serviceAccountName: nemo-gym-endpoint-registry
+      serviceAccountName: nemo-rl-endpoint-registry
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -77,6 +77,15 @@ spec:
           args:
             - |
               set -euo pipefail
+              if ! command -v git >/dev/null 2>&1; then
+                if command -v apt-get >/dev/null 2>&1; then
+                  DEBIAN_FRONTEND=noninteractive apt-get update
+                  DEBIAN_FRONTEND=noninteractive apt-get install -y git
+                else
+                  echo "git is required to install Harbor from responses_api_agents/harbor_agent/requirements.txt" >&2
+                  exit 1
+                fi
+              fi
 
               WORKSPACE_ROOT="${GYM_EVAL_WORKSPACE_ROOT:-/mnt/rl-workspace/gym-eval}"
               DEPS_ROOT="${GYM_DEPS_ROOT:-/mnt/rl-workspace/gym/deps}"
@@ -84,15 +93,52 @@ spec:
               GYM_INFRA_DIR="${GYM_INFRA_DIR:-${GYM_DIR}/infra/examples/opensandbox}"
               OPENSANDBOX_PYTHON_DIR="${OPENSANDBOX_PYTHON_DIR:-${DEPS_ROOT}/opensandbox-python}"
               HARBOR_DIR="${HARBOR_DIR:-${DEPS_ROOT}/harbor}"
-              RUN_ID="$(date -u +%Y%m%d-%H%M%S)-gym-harbor-mini-swe-eval"
-              RUN_DIR="${GYM_EVAL_RUN_DIR:-${WORKSPACE_ROOT}/runs/swebench_verified_harbor/${RUN_ID}}"
-              TASKS_DIR="${HARBOR_TASKS_DIR:-${WORKSPACE_ROOT}/data/harbor_swebench_verified_official}"
+              EVAL_BENCHMARK="${EVAL_BENCHMARK:-swebench}"
+              case "${EVAL_BENCHMARK}" in
+                swebench|swebench-verified)
+                  BENCHMARK_LABEL="swebench-verified"
+                  HARNESS_LABEL="harbor-mini-swe-agent"
+                  HARBOR_EVAL_AGENT="mini_swe"
+                  DEFAULT_HARBOR_CONFIG_PATH="responses_api_agents/harbor_agent/configs/harbor_agent_opensandbox_swebench_mini.yaml"
+                  DATASET_ALIAS="swebench"
+                  RUN_SUBDIR="swebench_verified_harbor"
+                  RUN_SUFFIX="gym-harbor-mini-swe-eval"
+                  DEFAULT_TASKS_DIR="${WORKSPACE_ROOT}/data/harbor_swebench_verified_official"
+                  DEFAULT_TASK_LIMIT="500"
+                  DEFAULT_UPLOAD_ENVIRONMENT_DIR="false"
+                  DEFAULT_POOL_PREFIX="swefastghcr"
+                  DEFAULT_SWEBENCH_EPOCH_GHCR="1"
+                  ;;
+                tbench2|terminal-bench|terminal-bench-2)
+                  BENCHMARK_LABEL="terminal-bench-2"
+                  HARNESS_LABEL="harbor-terminus-2"
+                  HARBOR_EVAL_AGENT="terminus_2"
+                  DEFAULT_HARBOR_CONFIG_PATH="responses_api_agents/harbor_agent/configs/harbor_agent_opensandbox_tbench2.yaml"
+                  DATASET_ALIAS="tbench2"
+                  RUN_SUBDIR="terminal_bench_2_harbor"
+                  RUN_SUFFIX="gym-harbor-tbench2-eval"
+                  DEFAULT_TASKS_DIR="${WORKSPACE_ROOT}/data/terminal_bench_2_harbor_tasks"
+                  DEFAULT_TASK_LIMIT="89"
+                  DEFAULT_UPLOAD_ENVIRONMENT_DIR="true"
+                  DEFAULT_POOL_PREFIX="tbench2"
+                  DEFAULT_SWEBENCH_EPOCH_GHCR="0"
+                  ;;
+                *)
+                  echo "Unknown EVAL_BENCHMARK=${EVAL_BENCHMARK}; expected swebench or tbench2" >&2
+                  exit 1
+                  ;;
+              esac
+              RUN_ID="$(date -u +%Y%m%d-%H%M%S)-${RUN_SUFFIX}"
+              RUN_DIR="${GYM_EVAL_RUN_DIR:-${WORKSPACE_ROOT}/runs/${RUN_SUBDIR}/${RUN_ID}}"
+              TASKS_DIR="${HARBOR_TASKS_DIR:-${DEFAULT_TASKS_DIR}}"
               HARBOR_JOBS_DIR="${HARBOR_JOBS_DIR:-${WORKSPACE_ROOT}/harbor_jobs}"
               INPUT=${RUN_DIR}/input.jsonl
               OUTPUT=${RUN_DIR}/rollouts.jsonl
               LOG_DIR=${RUN_DIR}/logs
               OBSERVABILITY_DIR=${RUN_DIR}/observability
-              VENV_DIR="${NEMO_GYM_UV_VENV_DIR:-${WORKSPACE_ROOT}/venvs/harbor-mini-swe-py312}"
+              ARCH_KEY="$(uname -m)"
+              DEFAULT_VENV_ROOT="${NEMO_GYM_UV_VENV_ROOT:-${WORKSPACE_ROOT}/venvs}"
+              VENV_DIR="${NEMO_GYM_UV_VENV_DIR:-${DEFAULT_VENV_ROOT}/harbor-mini-swe-py312-${ARCH_KEY}}"
               POOL_NAMES_FILE=${RUN_DIR}/opensandbox_pools.txt
               POOL_FILTER_FILE=${RUN_DIR}/opensandbox_pool_filter.txt
               export INPUT
@@ -101,12 +147,14 @@ spec:
               CONCURRENCY="${CONCURRENCY:-2}"
               CREATE_CONCURRENCY="${CREATE_CONCURRENCY:-2}"
               SDK_MAX_CONNECTIONS="${SDK_MAX_CONNECTIONS:-64}"
-              SDK_MAX_KEEPALIVE_CONNECTIONS="${SDK_MAX_KEEPALIVE_CONNECTIONS:-32}"
-              TASK_LIMIT="${TASK_LIMIT:-2}"
+              SDK_MAX_KEEPALIVE_CONNECTIONS="${SDK_MAX_KEEPALIVE_CONNECTIONS:-0}"
+              TASK_LIMIT="${TASK_LIMIT:-${DEFAULT_TASK_LIMIT}}"
               TASK_OFFSET="${TASK_OFFSET:-0}"
               TASK_STRIDE="${TASK_STRIDE:-1}"
               TASK_SAMPLE_SEED="${TASK_SAMPLE_SEED:-}"
+              NUM_REPEATS="${NUM_REPEATS:-1}"
               EXCLUDE_ROLLOUTS="${EXCLUDE_ROLLOUTS:-}"
+              echo "Using venv dir: ${VENV_DIR}"
               if [ "${NEMO_GYM_REBUILD_VENVS:-0}" = "1" ]; then
                 rm -rf "${VENV_DIR}"
               fi
@@ -184,13 +232,14 @@ spec:
                 --output "${INPUT}" \
                 --limit "${TASK_LIMIT}" \
                 "${SELECTION_ARGS[@]}" \
-                --dataset-alias swebench \
+                --dataset-alias "${DATASET_ALIAS}" \
                 "${EXCLUDE_ARGS[@]}"
               TARGET_ROWS="$(wc -l < "${INPUT}" | tr -d ' ')"
               if [ "${TARGET_ROWS}" -eq 0 ]; then
                 echo "No remaining rows to collect after applying excludes"
                 exit 0
               fi
+              EXPECTED_ROLLOUT_ROWS=$((TARGET_ROWS * NUM_REPEATS))
               if [ "${GYM_SANDBOX_POOL_ENABLED:-0}" = "1" ] \
                 && [ "${GYM_SANDBOX_POOL_ACQUIRE_POLICY:-direct_create}" != "fail_fast" ] \
                 && [ "${ALLOW_DIRECT_CREATE_FOR_EVAL:-0}" != "1" ]; then
@@ -199,7 +248,7 @@ spec:
               fi
               if [ "${OPENSANDBOX_GENERATE_HARBOR_TASK_POOLS:-0}" = "1" ] \
                 && [ -z "${OPENSANDBOX_POOL_REF_TEMPLATE:-}" ]; then
-                OPENSANDBOX_GENERATED_POOL_PREFIX="${OPENSANDBOX_GENERATED_POOL_PREFIX:-swefastghcr}"
+                OPENSANDBOX_GENERATED_POOL_PREFIX="${OPENSANDBOX_GENERATED_POOL_PREFIX:-${DEFAULT_POOL_PREFIX}}"
                 export OPENSANDBOX_POOL_REF_TEMPLATE="${OPENSANDBOX_GENERATED_POOL_PREFIX}-{task_name}-pool"
               fi
               POOL_FILTER_ARGS=()
@@ -261,6 +310,7 @@ spec:
               )
               SERVER_PID=""
               COLLECT_PID=""
+              STREAM_PIDS=()
               METRICS_PID=""
               TIMING_METRICS_PID=""
               cleanup_prewarmed_sandboxes() {
@@ -295,6 +345,17 @@ spec:
                   kill "${COLLECT_PID}" >/dev/null 2>&1 || true
                   wait "${COLLECT_PID}" >/dev/null 2>&1 || true
                 fi
+                if [ "${#STREAM_PIDS[@]}" -gt 0 ]; then
+                  for stream_pid in "${STREAM_PIDS[@]}"; do
+                    if kill -0 "${stream_pid}" >/dev/null 2>&1; then
+                      kill "${stream_pid}" >/dev/null 2>&1 || true
+                    fi
+                  done
+                  for stream_pid in "${STREAM_PIDS[@]}"; do
+                    wait "${stream_pid}" >/dev/null 2>&1 || true
+                  done
+                  STREAM_PIDS=()
+                fi
                 if [ -n "${SERVER_PID:-}" ]; then
                   kill "${SERVER_PID}" >/dev/null 2>&1 || true
                 fi
@@ -302,7 +363,6 @@ spec:
                   CLEANUP_ARGS=(
                     cleanup
                     --run-id "${RUN_ID}"
-                    --namespace "${OPENSANDBOX_NAMESPACE:-opensandbox}"
                     --pool-names-file "${POOL_NAMES_FILE}"
                   )
                   if [ "${OPENSANDBOX_KEEP_POOLS:-0}" = "1" ]; then
@@ -320,21 +380,373 @@ spec:
               trap cleanup_job EXIT
               trap terminate_job TERM INT
 
+              prepare_stream_chunks() {
+                STREAM_DIR="${RUN_DIR}/stream_chunks"
+                STREAM_CHUNKS_FILE="${STREAM_DIR}/chunks.tsv"
+                export STREAM_DIR STREAM_CHUNKS_FILE INPUT TARGET_ROWS
+                mkdir -p "${STREAM_DIR}"
+                python3 - <<'PY'
+              import json
+              import os
+              from pathlib import Path
+
+              input_path = Path(os.environ["INPUT"])
+              stream_dir = Path(os.environ["STREAM_DIR"])
+              chunks_path = Path(os.environ["STREAM_CHUNKS_FILE"])
+              target_rows = int(os.environ["TARGET_ROWS"])
+
+              chunks = []
+              with input_path.open("r", encoding="utf-8") as f:
+                  for task_index, line in enumerate(f):
+                      if task_index >= target_rows:
+                          break
+                      stripped = line.strip()
+                      if not stripped:
+                          continue
+                      row = json.loads(stripped)
+                      instance_id = row.get("instance_id")
+                      if not isinstance(instance_id, str) or not instance_id:
+                          raise RuntimeError(f"Row {task_index} is missing string instance_id")
+                      chunk_path = stream_dir / f"task_{task_index:06d}.jsonl"
+                      chunk_path.write_text(json.dumps(row, separators=(",", ":")) + "\n", encoding="utf-8")
+                      chunks.append((task_index, instance_id, chunk_path))
+
+              with chunks_path.open("w", encoding="utf-8") as f:
+                  for task_index, instance_id, chunk_path in chunks:
+                      f.write(f"{task_index}\t{instance_id}\t{chunk_path}\n")
+              print(f"Prepared {len(chunks)} stream chunks at {stream_dir}", flush=True)
+              PY
+              }
+
+              collect_gym_rollouts() {
+                local input_jsonl="$1"
+                local output_jsonl="$2"
+                local limit="$3"
+                local parallel="$4"
+                local log_fpath="$5"
+                set +e
+                "${UV_RUN[@]}" ng_collect_rollouts \
+                  "${COMMON_CONFIG[@]}" \
+                  "${POOL_CONFIG[@]}" \
+                  +agent_name=harbor_agent \
+                  +input_jsonl_fpath="${input_jsonl}" \
+                  +output_jsonl_fpath="${output_jsonl}" \
+                  +limit="${limit}" \
+                  +num_repeats="${NUM_REPEATS}" \
+                  +num_samples_in_parallel="${parallel}" \
+                  +upload_rollouts_to_wandb=false \
+                  "+responses_create_params={temperature: ${GENERATION_TEMPERATURE:-0.6}, top_p: ${GENERATION_TOP_P:-0.95}, max_output_tokens: ${GENERATION_MAX_OUTPUT_TOKENS:-49152}, metadata: {extra_body: \"{\\\"top_k\\\":${GENERATION_TOP_K:-20},\\\"min_p\\\":0.0,\\\"presence_penalty\\\":0.0,\\\"repetition_penalty\\\":1.0}\", chat_template_kwargs: \"{\\\"enable_thinking\\\":${GENERATION_ENABLE_THINKING:-true}}\"}}" \
+                  >"${log_fpath}" 2>&1
+                local collect_rc=$?
+                set -e
+                if [ "${collect_rc}" -ne 0 ]; then
+                  if [ -s "${output_jsonl}" ] && grep -q "/aggregate_metrics" "${log_fpath}"; then
+                    echo "Ignoring post-write aggregate_metrics failure from ng_collect_rollouts for ${input_jsonl}"
+                  else
+                    tail -n 200 "${log_fpath}"
+                    return "${collect_rc}"
+                  fi
+                fi
+                return 0
+              }
+
+              rewrite_stream_chunk_rollouts() {
+                local task_index="$1"
+                local chunk_output="$2"
+                local chunk_rewritten_output="$3"
+                python3 - "${task_index}" "${chunk_output}" "${chunk_rewritten_output}" <<'PY'
+              import json
+              import sys
+              from pathlib import Path
+
+              task_index = int(sys.argv[1])
+              input_path = Path(sys.argv[2])
+              output_path = Path(sys.argv[3])
+
+              rows = 0
+              with input_path.open("r", encoding="utf-8") as src, output_path.open("w", encoding="utf-8") as dst:
+                  for line in src:
+                      stripped = line.strip()
+                      if not stripped:
+                          continue
+                      row = json.loads(stripped)
+                      row["_ng_task_index"] = task_index
+                      dst.write(json.dumps(row, separators=(",", ":")) + "\n")
+                      rows += 1
+              if rows == 0:
+                  raise RuntimeError(f"No rollout rows found in {input_path}")
+              print(f"Rewrote {rows} rows for original task index {task_index}", flush=True)
+              PY
+              }
+
+              write_stream_chunk_failure_rollout() {
+                local task_index="$1"
+                local instance_id="$2"
+                local chunk_input="$3"
+                local chunk_rewritten_output="$4"
+                local failure_phase="$5"
+                local failure_rc="$6"
+                local failure_log="$7"
+                python3 - \
+                  "${task_index}" \
+                  "${instance_id}" \
+                  "${chunk_input}" \
+                  "${chunk_rewritten_output}" \
+                  "${failure_phase}" \
+                  "${failure_rc}" \
+                  "${failure_log}" <<'PY'
+              import json
+              import os
+              import sys
+              import time
+              from pathlib import Path
+
+              task_index = int(sys.argv[1])
+              instance_id = sys.argv[2]
+              input_path = Path(sys.argv[3])
+              output_path = Path(sys.argv[4])
+              failure_phase = sys.argv[5]
+              failure_rc = int(sys.argv[6])
+              failure_log = sys.argv[7]
+
+              source_row = {}
+              with input_path.open("r", encoding="utf-8") as f:
+                  for line in f:
+                      stripped = line.strip()
+                      if stripped:
+                          source_row = json.loads(stripped)
+                          break
+              if source_row.get("instance_id"):
+                  instance_id = str(source_row["instance_id"])
+
+              error_message = (
+                  f"Stream rollout chunk failed during {failure_phase} for task_index={task_index} "
+                  f"instance_id={instance_id}; see {failure_log}"
+              )
+              row = {
+                  "instance_id": instance_id,
+                  "_ng_task_index": task_index,
+                  "reward": 0.0,
+                  "agent_timeout_error": 0,
+                  "response": {
+                      "id": f"stream_failure_{task_index:06d}",
+                      "created_at": time.time(),
+                      "error": {
+                          "type": "stream_chunk_failed",
+                          "code": failure_phase,
+                          "message": error_message,
+                      },
+                      "incomplete_details": None,
+                      "instructions": None,
+                      "metadata": {},
+                      "model": os.environ.get("POLICY_MODEL_NAME"),
+                      "object": "response",
+                      "output": [],
+                      "status": "failed",
+                  },
+                  "metadata": {
+                      "exception_info": {
+                          "exception_type": "StreamChunkFailure",
+                          "phase": failure_phase,
+                          "returncode": failure_rc,
+                          "log_path": failure_log,
+                      },
+                      "stream_chunk_failure": {
+                          "phase": failure_phase,
+                          "returncode": failure_rc,
+                          "log_path": failure_log,
+                          "chunk_input": str(input_path),
+                      },
+                  },
+              }
+              if "verifier_metadata" in source_row:
+                  row["verifier_metadata"] = source_row["verifier_metadata"]
+              output_path.write_text(json.dumps(row, separators=(",", ":")) + "\n", encoding="utf-8")
+              print(
+                  f"Wrote failure rollout for task_index={task_index} instance_id={instance_id} phase={failure_phase}",
+                  flush=True,
+              )
+              PY
+              }
+
+              run_stream_chunk() {
+                local task_index="$1"
+                local instance_id="$2"
+                local chunk_input="$3"
+                local chunk_label
+                printf -v chunk_label "%06d" "${task_index}"
+                local chunk_log_dir="${LOG_DIR}/stream_task_${chunk_label}"
+                local chunk_output="${STREAM_DIR}/rollouts_${chunk_label}.jsonl"
+                local chunk_rewritten_output="${STREAM_DIR}/rollouts_${chunk_label}.rewritten.jsonl"
+                local prewarm_repeats="${GYM_SANDBOX_POOL_NUM_REPEATS:-${NUM_REPEATS}}"
+                local stream_chunk_concurrency="${GYM_SANDBOX_POOL_STREAM_CHUNK_CONCURRENCY:-${prewarm_repeats}}"
+                local stream_prepare_concurrency="${GYM_SANDBOX_POOL_STREAM_PREPARE_CONCURRENCY:-${stream_chunk_concurrency}}"
+                mkdir -p "${chunk_log_dir}"
+                echo "stream_task_start task_index=${task_index} instance_id=${instance_id}"
+
+                PREWARM_ARGS=(
+                  prewarm
+                  --agent-name harbor_agent
+                  --input-jsonl "${chunk_input}"
+                  --limit 1
+                  --num-repeats "${prewarm_repeats}"
+                  --concurrency "${stream_chunk_concurrency}"
+                  --create-concurrency 1
+                  --prepare-concurrency "${stream_prepare_concurrency}"
+                  --retries "${GYM_SANDBOX_POOL_PREWARM_RETRIES:-3}"
+                  --retry-delay-s "${GYM_SANDBOX_POOL_PREWARM_RETRY_DELAY_S:-10}"
+                  --retry-backoff "${GYM_SANDBOX_POOL_PREWARM_RETRY_BACKOFF:-2}"
+                  --retry-max-delay-s "${GYM_SANDBOX_POOL_PREWARM_RETRY_MAX_DELAY_S:-60}"
+                )
+                if [ "${GYM_SANDBOX_POOL_PREWARM_ENVIRONMENT_SETUP:-0}" = "1" ]; then
+                  PREWARM_ARGS+=(--prepare-environment)
+                fi
+                if [ "${GYM_SANDBOX_POOL_PREWARM_POLICY_PROXY:-0}" = "1" ]; then
+                  PREWARM_ARGS+=(--start-policy-proxy)
+                fi
+                local prewarm_rc=0
+                "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/prewarm_gym_harbor_sandboxes.py" \
+                  "${PREWARM_ARGS[@]}" \
+                  >"${chunk_log_dir}/sandbox_prewarm.json" 2>&1 || prewarm_rc=$?
+                if [ "${prewarm_rc}" -ne 0 ]; then
+                  write_stream_chunk_failure_rollout \
+                    "${task_index}" \
+                    "${instance_id}" \
+                    "${chunk_input}" \
+                    "${chunk_rewritten_output}" \
+                    "prewarm" \
+                    "${prewarm_rc}" \
+                    "${chunk_log_dir}/sandbox_prewarm.json"
+                  echo "stream_task_failed task_index=${task_index} instance_id=${instance_id} phase=prewarm rc=${prewarm_rc}"
+                  return 0
+                fi
+
+                local collect_rc=0
+                collect_gym_rollouts \
+                  "${chunk_input}" \
+                  "${chunk_output}" \
+                  1 \
+                  "${stream_chunk_concurrency}" \
+                  "${chunk_log_dir}/ng_collect_rollouts.log" || collect_rc=$?
+                if [ "${collect_rc}" -ne 0 ]; then
+                  write_stream_chunk_failure_rollout \
+                    "${task_index}" \
+                    "${instance_id}" \
+                    "${chunk_input}" \
+                    "${chunk_rewritten_output}" \
+                    "collect" \
+                    "${collect_rc}" \
+                    "${chunk_log_dir}/ng_collect_rollouts.log"
+                  echo "stream_task_failed task_index=${task_index} instance_id=${instance_id} phase=collect rc=${collect_rc}"
+                  return 0
+                fi
+
+                local rewrite_rc=0
+                rewrite_stream_chunk_rollouts \
+                  "${task_index}" \
+                  "${chunk_output}" \
+                  "${chunk_rewritten_output}" || rewrite_rc=$?
+                if [ "${rewrite_rc}" -ne 0 ]; then
+                  write_stream_chunk_failure_rollout \
+                    "${task_index}" \
+                    "${instance_id}" \
+                    "${chunk_input}" \
+                    "${chunk_rewritten_output}" \
+                    "rewrite" \
+                    "${rewrite_rc}" \
+                    "${chunk_log_dir}/ng_collect_rollouts.log"
+                  echo "stream_task_failed task_index=${task_index} instance_id=${instance_id} phase=rewrite rc=${rewrite_rc}"
+                  return 0
+                fi
+                echo "stream_task_done task_index=${task_index} instance_id=${instance_id} output=${chunk_rewritten_output}"
+              }
+
+              collect_streaming_rollouts() {
+                prepare_stream_chunks
+                "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/prewarm_gym_harbor_sandboxes.py" \
+                  cleanup \
+                  --agent-name harbor_agent \
+                  >"${LOG_DIR}/sandbox_prewarm_cleanup_before_stream.log" 2>&1 || true
+
+                local stream_workers="${GYM_SANDBOX_POOL_STREAM_WORKERS:-${GYM_SANDBOX_POOL_PREWARM_TASK_CONCURRENCY:-${CREATE_CONCURRENCY}}}"
+                if [ "${stream_workers}" -lt 1 ]; then
+                  echo "GYM_SANDBOX_POOL_STREAM_WORKERS must be >= 1" >&2
+                  return 1
+                fi
+                local stream_rc=0
+                local active_pids=()
+                STREAM_PIDS=()
+                : >"${LOG_DIR}/ng_collect_rollouts.log"
+
+                wait_for_stream_slot() {
+                  local next_active=()
+                  while [ "${#active_pids[@]}" -ge "${stream_workers}" ]; do
+                    next_active=()
+                    for pid in "${active_pids[@]}"; do
+                      if kill -0 "${pid}" >/dev/null 2>&1; then
+                        next_active+=("${pid}")
+                      else
+                        if ! wait "${pid}"; then
+                          stream_rc=1
+                        fi
+                      fi
+                    done
+                    active_pids=("${next_active[@]}")
+                    if [ "${#active_pids[@]}" -ge "${stream_workers}" ]; then
+                      sleep "${GYM_SANDBOX_POOL_STREAM_POLL_INTERVAL_S:-5}"
+                    fi
+                  done
+                }
+
+                while IFS=$'\t' read -r task_index instance_id chunk_input; do
+                  run_stream_chunk "${task_index}" "${instance_id}" "${chunk_input}" \
+                    >>"${LOG_DIR}/ng_collect_rollouts.log" 2>&1 &
+                  local pid=$!
+                  STREAM_PIDS+=("${pid}")
+                  active_pids+=("${pid}")
+                  wait_for_stream_slot
+                done < "${STREAM_CHUNKS_FILE}"
+
+                for pid in "${active_pids[@]}"; do
+                  if ! wait "${pid}"; then
+                    stream_rc=1
+                  fi
+                done
+                STREAM_PIDS=()
+                if [ "${stream_rc}" -ne 0 ]; then
+                  tail -n 200 "${LOG_DIR}/ng_collect_rollouts.log"
+                  return "${stream_rc}"
+                fi
+
+                : >"${OUTPUT}"
+                while IFS=$'\t' read -r task_index _instance_id _chunk_input; do
+                  local chunk_label
+                  printf -v chunk_label "%06d" "${task_index}"
+                  local chunk_rewritten_output="${STREAM_DIR}/rollouts_${chunk_label}.rewritten.jsonl"
+                  if [ ! -s "${chunk_rewritten_output}" ]; then
+                    echo "Missing stream rollout chunk ${chunk_rewritten_output}" >&2
+                    return 1
+                  fi
+                  cat "${chunk_rewritten_output}" >>"${OUTPUT}"
+                done < "${STREAM_CHUNKS_FILE}"
+                echo "stream_rollouts_done output=${OUTPUT}"
+              }
+
               WANDB_RUN_ID="$(python3 -c 'import hashlib, os; print(hashlib.sha1(os.environ["NEMO_RL_SANDBOX_OBSERVABILITY_RUN_ID"].encode()).hexdigest()[:16])')"
               export WANDB_RUN_ID
               export WANDB_RESUME="${WANDB_RESUME:-allow}"
               if [ "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB}" = "1" ]; then
                 "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/start_wandb_observability_run.py" \
-                  --benchmark swebench-verified \
-                  --harness harbor-mini-swe-agent \
+                  --benchmark "${BENCHMARK_LABEL}" \
+                  --harness "${HARNESS_LABEL}" \
                   | tee "${RUN_DIR}/wandb_start.json"
               fi
               if [ "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB}" = "1" ] && [ "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_LIVE_METRICS}" = "1" ]; then
                 "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/stream_wandb_observability_metrics.py" \
                   "${OBSERVABILITY_DIR}" \
                   --rollouts "${OUTPUT}" \
-                  --benchmark swebench-verified \
-                  --harness harbor-mini-swe-agent \
+                  --benchmark "${BENCHMARK_LABEL}" \
+                  --harness "${HARNESS_LABEL}" \
                   --target-rows "${TARGET_ROWS}" \
                   --interval-s "${NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_LIVE_INTERVAL_S}" \
                   --pool-agent-name harbor_agent \
@@ -364,7 +776,7 @@ spec:
                   if [[ "${OPENSANDBOX_POOL_REF_TEMPLATE:-}" == *"${POOL_TEMPLATE_SUFFIX}" ]]; then
                     OPENSANDBOX_GENERATED_POOL_PREFIX="${OPENSANDBOX_POOL_REF_TEMPLATE%"${POOL_TEMPLATE_SUFFIX}"}"
                   else
-                    OPENSANDBOX_GENERATED_POOL_PREFIX="swefastghcr"
+                    OPENSANDBOX_GENERATED_POOL_PREFIX="${DEFAULT_POOL_PREFIX}"
                   fi
                 fi
                 GENERATED_POOL_MANIFEST="${RUN_DIR}/generated_harbor_task_pools.yaml"
@@ -373,7 +785,7 @@ spec:
                   --tasks-dir "${TASKS_DIR}"
                   --output "${GENERATED_POOL_MANIFEST}"
                   --report-output "${GENERATED_POOL_REPORT}"
-                  --benchmark-label swebench-verified
+                  --benchmark-label "${BENCHMARK_LABEL}"
                   --pool-prefix "${OPENSANDBOX_GENERATED_POOL_PREFIX}"
                   --max-tasks "${OPENSANDBOX_GENERATE_POOL_MAX_TASKS:-${TASK_LIMIT}}"
                   --arch "${OPENSANDBOX_GENERATE_POOL_ARCH:-amd64}"
@@ -389,7 +801,7 @@ spec:
                   --pool-max "${OPENSANDBOX_GENERATE_POOL_MAX:-1}"
                   --execd-image "${OPENSANDBOX_EXECD_IMAGE:-mirror.gcr.io/opensandbox/execd:v1.0.15}"
                 )
-                if [ "${OPENSANDBOX_GENERATE_POOL_SWEBENCH_EPOCH_GHCR:-1}" = "1" ]; then
+                if [ "${OPENSANDBOX_GENERATE_POOL_SWEBENCH_EPOCH_GHCR:-${DEFAULT_SWEBENCH_EPOCH_GHCR}}" = "1" ]; then
                   GENERATED_POOL_ARGS+=(--swebench-epoch-ghcr)
                 fi
                 if [ "${OPENSANDBOX_GENERATE_POOL_MINI_SWE_AGENT_INIT_INSTALL:-0}" = "1" ]; then
@@ -445,7 +857,7 @@ spec:
                 done
               fi
               MODEL_CONFIG_PATH=responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
-              HARBOR_CONFIG_PATH=responses_api_agents/harbor_agent/configs/harbor_agent_opensandbox_swebench_mini.yaml
+              HARBOR_CONFIG_PATH="${HARBOR_CONFIG_PATH:-${DEFAULT_HARBOR_CONFIG_PATH}}"
               CONFIG_PATHS="${MODEL_CONFIG_PATH},${HARBOR_CONFIG_PATH}"
               DIRECT_MODEL_BASE_URL="${DIRECT_MODEL_BASE_URL:-${POLICY_BASE_URL:-http://vllm.default.svc.cluster.local:8000/v1}}"
               DIRECT_API_KEY="${POLICY_API_KEY:-dummy}"
@@ -482,10 +894,10 @@ spec:
               MINI_SWE_CONFIG_PATH="${RUN_DIR}/mini_swe_agent_responses_swebench.yaml"
               export MINI_SWE_CONFIG_SOURCE="${GYM_DIR}/responses_api_agents/harbor_agent/configs/mini_swe_agent_responses_swebench.yaml"
               export MINI_SWE_CONFIG_PATH
-              export MINI_SWE_CONFIG_TEMPERATURE="${MINI_SWE_CONFIG_TEMPERATURE-${GENERATION_TEMPERATURE-0.0}}"
-              export MINI_SWE_CONFIG_TOP_P="${MINI_SWE_CONFIG_TOP_P-${GENERATION_TOP_P-null}}"
-              export MINI_SWE_CONFIG_TOP_K="${MINI_SWE_CONFIG_TOP_K-${GENERATION_TOP_K-null}}"
-              export MINI_SWE_CONFIG_ENABLE_THINKING="${MINI_SWE_CONFIG_ENABLE_THINKING-${GENERATION_ENABLE_THINKING-true}}"
+              export MINI_SWE_CONFIG_TEMPERATURE="${MINI_SWE_CONFIG_TEMPERATURE:-${GENERATION_TEMPERATURE:-0.6}}"
+              export MINI_SWE_CONFIG_TOP_P="${MINI_SWE_CONFIG_TOP_P:-${GENERATION_TOP_P:-0.95}}"
+              export MINI_SWE_CONFIG_TOP_K="${MINI_SWE_CONFIG_TOP_K:-${GENERATION_TOP_K:-20}}"
+              export MINI_SWE_CONFIG_ENABLE_THINKING="${MINI_SWE_CONFIG_ENABLE_THINKING:-${GENERATION_ENABLE_THINKING:-true}}"
               export MINI_SWE_CONFIG_DROP_PARAMS="${MINI_SWE_CONFIG_DROP_PARAMS-true}"
               export MINI_SWE_CONFIG_PARALLEL_TOOL_CALLS="${MINI_SWE_CONFIG_PARALLEL_TOOL_CALLS-true}"
               export MINI_SWE_CONFIG_STEP_LIMIT="${MINI_SWE_CONFIG_STEP_LIMIT:-}"
@@ -620,6 +1032,19 @@ spec:
               else
                 MINI_SWE_PRE_AGENT_SETUP_OVERRIDE="+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.pre_agent_setup_commands=[]"
               fi
+              AGENT_OVERRIDE_CONFIG=()
+              if [ "${HARBOR_EVAL_AGENT}" = "mini_swe" ]; then
+                AGENT_OVERRIDE_CONFIG=(
+                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_agent_import_path=responses_api_agents.harbor_agent.custom_agents.installed:CachedMiniSweAgent"
+                  "++harbor_agent.responses_api_agents.harbor_agent.harbor_agent_kwargs.version=${MINI_SWE_AGENT_VERSION:-null}"
+                  "++harbor_agent.responses_api_agents.harbor_agent.harbor_agent_kwargs.config_file=${MINI_SWE_CONFIG_PATH}"
+                  "${MINI_SWE_PRE_AGENT_SETUP_OVERRIDE}"
+                )
+              elif [ "${HARBOR_EVAL_AGENT}" = "terminus_2" ]; then
+                AGENT_OVERRIDE_CONFIG=(
+                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_agent_import_path=responses_api_agents.harbor_agent.custom_agents.terminus_2_nemo_gym:Terminus2NemoGym"
+                )
+              fi
               RESPONSE_OUTPUT_MODE="${HARBOR_RESPONSE_OUTPUT_MODE:-policy_trace}"
               POLICY_PROXY_CONFIG=()
               if [ "${EVAL_SKIP_POLICY_PROXY:-0}" = "1" ]; then
@@ -627,10 +1052,10 @@ spec:
               else
                 POLICY_PROXY_CONFIG=(
                   "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.responses_upstream_api=${POLICY_PROXY_RESPONSES_UPSTREAM_API:-responses}"
-                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.generation_temperature=${POLICY_PROXY_GENERATION_TEMPERATURE-${GENERATION_TEMPERATURE-0.0}}"
-                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.generation_top_p=${POLICY_PROXY_GENERATION_TOP_P-${GENERATION_TOP_P-null}}"
-                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.generation_top_k=${POLICY_PROXY_GENERATION_TOP_K-${GENERATION_TOP_K-null}}"
-                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.generation_chat_template_kwargs.enable_thinking=${POLICY_PROXY_GENERATION_ENABLE_THINKING-${GENERATION_ENABLE_THINKING-true}}"
+                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.generation_temperature=${POLICY_PROXY_GENERATION_TEMPERATURE:-${GENERATION_TEMPERATURE:-0.6}}"
+                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.generation_top_p=${POLICY_PROXY_GENERATION_TOP_P:-${GENERATION_TOP_P:-0.95}}"
+                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.generation_top_k=${POLICY_PROXY_GENERATION_TOP_K:-${GENERATION_TOP_K:-20}}"
+                  "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.generation_chat_template_kwargs.enable_thinking=${POLICY_PROXY_GENERATION_ENABLE_THINKING:-${GENERATION_ENABLE_THINKING:-true}}"
                   "+harbor_agent.responses_api_agents.harbor_agent.harbor_policy_proxy.force_generation_params=${POLICY_PROXY_FORCE_GENERATION_PARAMS:-true}"
                 )
               fi
@@ -651,32 +1076,26 @@ spec:
                 "+harbor_agent.responses_api_agents.harbor_agent.runner_backend=async"
                 "+harbor_agent.responses_api_agents.harbor_agent.response_output_mode=${RESPONSE_OUTPUT_MODE}"
                 "+harbor_agent.responses_api_agents.harbor_agent.runner_num_cpus=0.0"
-                "+harbor_agent.responses_api_agents.harbor_agent.harbor_agent_import_path=nemo_gym.sandbox.integrations.harbor_agents:CachedMiniSweAgent"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_agent_override_timeout=${HARBOR_AGENT_OVERRIDE_TIMEOUT:-null}"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_agent_override_setup_timeout=1800"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_run_timeout=${HARBOR_RUN_TIMEOUT:-3900}"
-                "++harbor_agent.responses_api_agents.harbor_agent.harbor_agent_kwargs.version=${MINI_SWE_AGENT_VERSION:-null}"
-                "++harbor_agent.responses_api_agents.harbor_agent.harbor_agent_kwargs.config_file=${MINI_SWE_CONFIG_PATH}"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_verifier_override_timeout=${HARBOR_VERIFIER_OVERRIDE_TIMEOUT:-null}"
                 "${POLICY_PROXY_CONFIG[@]}"
+                "${AGENT_OVERRIDE_CONFIG[@]}"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batch_create_concurrency=${CREATE_CONCURRENCY}"
-                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batch_mode=${OPENSANDBOX_BATCH_MODE:-sdk}"
-                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batch_create_progress_timeout_s=300"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batch_create_progress_timeout_s=${OPENSANDBOX_BATCH_CREATE_PROGRESS_TIMEOUT_S:-300}"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.sdk_max_connections=${SDK_MAX_CONNECTIONS}"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.sdk_max_keepalive_connections=${SDK_MAX_KEEPALIVE_CONNECTIONS}"
-                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batchsandbox_ready_timeout_s=${OPENSANDBOX_BATCHSANDBOX_READY_TIMEOUT_S:-300}"
-                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batchsandbox_progress_timeout_s=${OPENSANDBOX_BATCHSANDBOX_PROGRESS_TIMEOUT_S:-120}"
-                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batchsandbox_endpoint_only_ready_after_s=${OPENSANDBOX_BATCHSANDBOX_ENDPOINT_ONLY_READY_AFTER_S:-5}"
-                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batchsandbox_poll_interval_s=${OPENSANDBOX_BATCHSANDBOX_POLL_INTERVAL_S:-0.1}"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.create_probe_command='${OPENSANDBOX_CREATE_PROBE_COMMAND:-true}'"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.create_probe_expected_stdout=${OPENSANDBOX_CREATE_PROBE_EXPECTED_STDOUT:-null}"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.create_probe_timeout_s=${OPENSANDBOX_CREATE_PROBE_TIMEOUT_S:-30}"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.create_probe_sample_count=${OPENSANDBOX_CREATE_PROBE_SAMPLE_COUNT:-null}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.create_probe_stable_count=${OPENSANDBOX_CREATE_PROBE_STABLE_COUNT:-3}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.create_probe_stable_delay_s=${OPENSANDBOX_CREATE_PROBE_STABLE_DELAY_S:-0.5}"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.start_probe_command='${OPENSANDBOX_START_PROBE_COMMAND:-true}'"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.start_probe_expected_stdout=${OPENSANDBOX_START_PROBE_EXPECTED_STDOUT:-null}"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.start_probe_timeout_s=${OPENSANDBOX_START_PROBE_TIMEOUT_S:-30}"
-                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.upload_environment_dir=${HARBOR_UPLOAD_ENVIRONMENT_DIR:-false}"
-                "${MINI_SWE_PRE_AGENT_SETUP_OVERRIDE}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.upload_environment_dir=${HARBOR_UPLOAD_ENVIRONMENT_DIR:-${DEFAULT_UPLOAD_ENVIRONMENT_DIR}}"
                 "++harbor_agent.responses_api_agents.harbor_agent.sandbox_pool.enabled=${GYM_SANDBOX_POOL_ENABLED:-false}"
                 "++harbor_agent.responses_api_agents.harbor_agent.sandbox_pool.acquire_policy=${GYM_SANDBOX_POOL_ACQUIRE_POLICY:-direct_create}"
                 "++harbor_agent.responses_api_agents.harbor_agent.sandbox_pool.verify_preallocated_handle=${GYM_SANDBOX_POOL_VERIFY_PREALLOCATED_HANDLE:-false}"
@@ -686,17 +1105,17 @@ spec:
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batch_create_retries=10"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batch_create_retry_delay_s=2.0"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.batch_create_retry_max_delay_s=90.0"
-                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.operation_retries=5"
-                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.operation_retry_delay_s=1.0"
-                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.operation_retry_max_delay_s=30.0"
-                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.create_request_timeout_s=300"
-                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.create_timeout_s=600"
-                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.request_timeout_s=300"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.operation_retries=${OPENSANDBOX_OPERATION_RETRIES:-10}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.operation_retry_delay_s=${OPENSANDBOX_OPERATION_RETRY_DELAY_S:-1.0}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.operation_retry_max_delay_s=${OPENSANDBOX_OPERATION_RETRY_MAX_DELAY_S:-45.0}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.create_request_timeout_s=${OPENSANDBOX_CREATE_REQUEST_TIMEOUT_S:-300}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.create_timeout_s=${OPENSANDBOX_CREATE_TIMEOUT_S:-600}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.provider.kwargs.request_timeout_s=${OPENSANDBOX_REQUEST_TIMEOUT_S:-300}"
                 "++harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.spec.timeout_s=7200"
-                "++harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.spec.resources.cpu=500m"
-                "++harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.spec.resources.memory=4Gi"
-                "++harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.spec.resources.ephemeral-storage=4Gi"
-                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.spec.metadata.run_family=gym-harbor-mini-swe-eval-full"
+                "++harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.spec.resources.cpu=${SANDBOX_CPU:-500m}"
+                "++harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.spec.resources.memory=${SANDBOX_MEMORY:-8Gi}"
+                "++harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.spec.resources.ephemeral-storage=${SANDBOX_EPHEMERAL_STORAGE:-20Gi}"
+                "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.spec.metadata.run_family=${RUN_SUFFIX}-full"
                 "+harbor_agent.responses_api_agents.harbor_agent.harbor_environment_kwargs.spec.metadata.run_id=${RUN_ID}"
               )
               POOL_CONFIG=()
@@ -729,7 +1148,8 @@ spec:
                 exit 1
               fi
 
-              if [ "${GYM_SANDBOX_POOL_ENABLED:-0}" = "1" ]; then
+              if [ "${GYM_SANDBOX_POOL_ENABLED:-0}" = "1" ] \
+                && { [ "${GYM_SANDBOX_POOL_STREAM_BY_TASK:-1}" != "1" ] || [ "${PREWARM_ONLY:-0}" = "1" ]; }; then
                 PREWARM_ARGS=(
                   prewarm \
                   --agent-name harbor_agent \
@@ -767,36 +1187,29 @@ spec:
                 exit 0
               fi
 
-              set +e
-              "${UV_RUN[@]}" ng_collect_rollouts \
-                "${COMMON_CONFIG[@]}" \
-                "${POOL_CONFIG[@]}" \
-                +agent_name=harbor_agent \
-                +input_jsonl_fpath="${INPUT}" \
-                +output_jsonl_fpath="${OUTPUT}" \
-                +limit="${TARGET_ROWS}" \
-                +num_samples_in_parallel="${CONCURRENCY}" \
-                +upload_rollouts_to_wandb=false \
-                "+responses_create_params={temperature: ${GENERATION_TEMPERATURE-0.0}, top_p: ${GENERATION_TOP_P-null}, max_output_tokens: ${GENERATION_MAX_OUTPUT_TOKENS:-49152}, metadata: {extra_body: \"{\\\"top_k\\\":${GENERATION_TOP_K-null},\\\"min_p\\\":0.0,\\\"presence_penalty\\\":0.0,\\\"repetition_penalty\\\":1.0}\", chat_template_kwargs: \"{\\\"enable_thinking\\\":${GENERATION_ENABLE_THINKING-true}}\"}}" \
-                >"${LOG_DIR}/ng_collect_rollouts.log" 2>&1 &
-              COLLECT_PID=$!
-              wait "${COLLECT_PID}"
-              COLLECT_RC=$?
-              COLLECT_PID=""
-              set -e
-              if [ "${COLLECT_RC}" -ne 0 ]; then
-                if [ -s "${OUTPUT}" ] && grep -q "/aggregate_metrics" "${LOG_DIR}/ng_collect_rollouts.log"; then
-                  echo "Ignoring post-write aggregate_metrics failure from ng_collect_rollouts"
-                else
-                  tail -n 200 "${LOG_DIR}/ng_collect_rollouts.log"
+              if [ "${GYM_SANDBOX_POOL_ENABLED:-0}" = "1" ] \
+                && [ "${GYM_SANDBOX_POOL_STREAM_BY_TASK:-1}" = "1" ]; then
+                collect_streaming_rollouts
+              else
+                collect_gym_rollouts \
+                  "${INPUT}" \
+                  "${OUTPUT}" \
+                  "${TARGET_ROWS}" \
+                  "${CONCURRENCY}" \
+                  "${LOG_DIR}/ng_collect_rollouts.log" &
+                COLLECT_PID=$!
+                wait "${COLLECT_PID}"
+                COLLECT_RC=$?
+                COLLECT_PID=""
+                if [ "${COLLECT_RC}" -ne 0 ]; then
                   exit "${COLLECT_RC}"
                 fi
               fi
-              cleanup_prewarmed_sandboxes
+              cleanup_prewarmed_sandboxes || true
 
               "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/verify_gym_rollouts.py" \
                 "${OUTPUT}" \
-                --min-rows "${TARGET_ROWS}" \
+                --min-rows "${EXPECTED_ROLLOUT_ROWS}" \
                 | tee "${RUN_DIR}/verify.json"
 
               "${UV_RUN[@]}" python "${GYM_INFRA_DIR}/summarize_harbor_trajectory_timing.py" \
@@ -854,9 +1267,9 @@ spec:
             - name: SDK_MAX_CONNECTIONS
               value: "64"
             - name: SDK_MAX_KEEPALIVE_CONNECTIONS
-              value: "32"
-            - name: OPENSANDBOX_BATCH_MODE
-              value: batchsandbox
+              value: "0"
+            - name: OPENSANDBOX_EXECD_IMAGE
+              value: mirror.gcr.io/opensandbox/execd:v1.0.15
             - name: OPENSANDBOX_GENERATE_HARBOR_TASK_POOLS
               value: "0"
             - name: OPENSANDBOX_GENERATED_POOL_PREFIX
@@ -897,24 +1310,38 @@ spec:
               value: "2"
             - name: GYM_SANDBOX_POOL_PREWARM_PREPARE_CONCURRENCY
               value: "2"
+            - name: GYM_SANDBOX_POOL_STREAM_BY_TASK
+              value: "1"
+            - name: GYM_SANDBOX_POOL_STREAM_WORKERS
+              value: "2"
+            - name: GYM_SANDBOX_POOL_STREAM_CHUNK_CONCURRENCY
+              value: "1"
             - name: HARBOR_UPLOAD_ENVIRONMENT_DIR
               value: "false"
             - name: OPENSANDBOX_CREATE_PROBE_COMMAND
               value: "true"
             - name: OPENSANDBOX_CREATE_PROBE_TIMEOUT_S
               value: "60"
-            - name: OPENSANDBOX_BATCHSANDBOX_READY_TIMEOUT_S
-              value: "600"
-            - name: OPENSANDBOX_BATCHSANDBOX_PROGRESS_TIMEOUT_S
+            - name: OPENSANDBOX_CREATE_PROBE_STABLE_COUNT
+              value: "3"
+            - name: OPENSANDBOX_CREATE_PROBE_STABLE_DELAY_S
+              value: "0.5"
+            - name: OPENSANDBOX_BATCH_CREATE_PROGRESS_TIMEOUT_S
               value: "300"
-            - name: OPENSANDBOX_BATCHSANDBOX_ENDPOINT_ONLY_READY_AFTER_S
-              value: "5"
+            - name: OPENSANDBOX_CREATE_REQUEST_TIMEOUT_S
+              value: "300"
+            - name: OPENSANDBOX_CREATE_TIMEOUT_S
+              value: "600"
+            - name: OPENSANDBOX_REQUEST_TIMEOUT_S
+              value: "300"
             - name: OPENSANDBOX_START_PROBE_COMMAND
               value: "true"
             - name: MINI_SWE_AGENT_PREINSTALL
               value: "1"
             - name: TASK_LIMIT
               value: "2"
+            - name: NUM_REPEATS
+              value: "1"
             - name: MINI_SWE_CONFIG_STEP_LIMIT
               value: ""
             - name: EVAL_SKIP_POLICY_PROXY
@@ -927,6 +1354,8 @@ spec:
               value: "0.95"
             - name: GENERATION_TOP_K
               value: "20"
+            - name: GENERATION_ENABLE_THINKING
+              value: "true"
             - name: GENERATION_MAX_OUTPUT_TOKENS
               value: "49152"
             - name: POLICY_PROXY_RESPONSES_UPSTREAM_API
@@ -937,8 +1366,8 @@ spec:
               value: "0"
             - name: NEMO_GYM_SKIP_VENV_IF_PRESENT
               value: "true"
-            - name: NEMO_GYM_UV_VENV_DIR
-              value: /mnt/rl-workspace/gym-eval/venvs/harbor-mini-swe-py312
+            - name: NEMO_GYM_UV_VENV_ROOT
+              value: /mnt/rl-workspace/gym-eval/venvs
             - name: NEMO_GYM_RAY_ENABLED
               value: "false"
             - name: TASK_OFFSET

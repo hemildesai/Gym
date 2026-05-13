@@ -16,21 +16,21 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager, contextmanager
-from contextvars import ContextVar, Token
 import atexit
 import json
 import os
-from pathlib import Path
 import re
 import threading
 import time
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar, Token
+from pathlib import Path
 from typing import Any, Iterator
 
 from nemo_gym.sandbox.observability.events import (
     SCHEMA_VERSION,
-    SandboxEvent,
     ResourceSample,
+    SandboxEvent,
     safe_attributes,
     stable_hash,
 )
@@ -118,11 +118,7 @@ class SandboxEventRecorder:
         """Append one event and mirror it to configured live sinks."""
         attrs = safe_attributes({**G_EVENT_CONTEXT.get(), **(attributes or {})})
         event_time = time.time() if timestamp_unix_s is None else timestamp_unix_s
-        event_monotonic = (
-            time.monotonic()
-            if timestamp_unix_s is None and monotonic_s is None
-            else monotonic_s
-        )
+        event_monotonic = time.monotonic() if timestamp_unix_s is None and monotonic_s is None else monotonic_s
         event: SandboxEvent = {
             "schema_version": SCHEMA_VERSION,
             "timestamp_unix_s": event_time,
@@ -523,13 +519,9 @@ class _OtelSink:
 
     def record_resource_sample(self, sample: ResourceSample) -> None:
         attrs = _low_cardinality_attrs(sample.get("attributes") or {})
-        if self._memory_histogram is not None and isinstance(
-            sample.get("memory_usage_bytes"), int
-        ):
+        if self._memory_histogram is not None and isinstance(sample.get("memory_usage_bytes"), int):
             self._memory_histogram.record(float(sample["memory_usage_bytes"]), attrs)
-        if self._cpu_histogram is not None and isinstance(
-            sample.get("cpu_utilization"), (int, float)
-        ):
+        if self._cpu_histogram is not None and isinstance(sample.get("cpu_utilization"), (int, float)):
             self._cpu_histogram.record(float(sample["cpu_utilization"]), attrs)
 
     def shutdown(self) -> None:
@@ -542,17 +534,12 @@ def _low_cardinality_attrs(attributes: dict[str, Any]) -> dict[str, str]:
         "phase",
         "status",
         "provider",
-        "batch_mode",
         "command_class",
         "stop_reason",
         "harness",
         "source",
     )
-    return {
-        key: str(attributes[key])
-        for key in allowed
-        if key in attributes and attributes[key] is not None
-    }
+    return {key: str(attributes[key]) for key in allowed if key in attributes and attributes[key] is not None}
 
 
 def _safe_metric_component(value: Any) -> str:
@@ -576,12 +563,8 @@ def log_wandb_artifact(output_dir: Path, cfg: dict[str, Any]) -> None:
         wandb_dir = Path(os.environ.get("WANDB_DIR", output_dir.parent / "wandb"))
         wandb_dir.mkdir(parents=True, exist_ok=True)
         init_kwargs = {
-            "project": cfg.get("project")
-            or os.environ.get("WANDB_PROJECT")
-            or "nemo-rl-sandbox-eval",
-            "name": cfg.get("run_name")
-            or os.environ.get("WANDB_NAME")
-            or output_dir.parent.name,
+            "project": cfg.get("project") or os.environ.get("WANDB_PROJECT") or "nemo-rl-sandbox-eval",
+            "name": cfg.get("run_name") or os.environ.get("WANDB_NAME") or output_dir.parent.name,
             "job_type": "sandbox-observability",
             "dir": str(wandb_dir),
         }
@@ -715,14 +698,10 @@ def _wandb_time_series_rows(
                 payload[f"{prefix}/events/duration_s"] = float(duration_s)
                 phase = attrs.get("phase")
                 if phase:
-                    payload[
-                        f"{prefix}/events/by_phase/{_safe_metric_component(phase)}/duration_s"
-                    ] = float(duration_s)
+                    payload[f"{prefix}/events/by_phase/{_safe_metric_component(phase)}/duration_s"] = float(duration_s)
                 name = event.get("name")
                 if name:
-                    payload[
-                        f"{prefix}/events/by_name/{_safe_metric_component(name)}/duration_s"
-                    ] = float(duration_s)
+                    payload[f"{prefix}/events/by_name/{_safe_metric_component(name)}/duration_s"] = float(duration_s)
             if attrs.get("status") == "error":
                 error_count += 1
                 payload[f"{prefix}/errors/count"] = 1
@@ -760,9 +739,7 @@ def _wandb_time_series_rows(
             )
             stop_reason = attrs.get("stop_reason")
             if stop_reason:
-                payload[
-                    f"{prefix}/trajectory/stop_reason/{_safe_metric_component(stop_reason)}"
-                ] = 1
+                payload[f"{prefix}/trajectory/stop_reason/{_safe_metric_component(stop_reason)}"] = 1
         if len(payload) > 1:
             rows.append((elapsed_time_s, payload))
 
@@ -823,10 +800,7 @@ def _sample_time_series_rows(
     if max_points <= 1:
         return [rows[-1]]
     last_index = len(rows) - 1
-    return [
-        rows[round(index * last_index / (max_points - 1))]
-        for index in range(max_points)
-    ]
+    return [rows[round(index * last_index / (max_points - 1))] for index in range(max_points)]
 
 
 def _define_wandb_time_metrics(wandb: Any, *, prefix: str) -> None:
@@ -1146,19 +1120,12 @@ def build_recorder_from_env() -> SandboxEventRecorder | None:
         return None
     return SandboxEventRecorder(
         output_dir=Path(output_dir),
-        resource_sample_interval_s=float(
-            os.environ.get("NEMO_RL_SANDBOX_OBSERVABILITY_RESOURCE_INTERVAL_S", "10")
-        ),
-        max_rendered_trajectories=int(
-            os.environ.get("NEMO_RL_SANDBOX_OBSERVABILITY_MAX_RENDERED", "40")
-        ),
+        resource_sample_interval_s=float(os.environ.get("NEMO_RL_SANDBOX_OBSERVABILITY_RESOURCE_INTERVAL_S", "10")),
+        max_rendered_trajectories=int(os.environ.get("NEMO_RL_SANDBOX_OBSERVABILITY_MAX_RENDERED", "40")),
         artifacts={
-            "enabled": os.environ.get("NEMO_RL_SANDBOX_OBSERVABILITY_ARTIFACTS", "1")
-            != "0",
-            "render_html": os.environ.get("NEMO_RL_SANDBOX_OBSERVABILITY_RENDER_HTML", "1")
-            != "0",
-            "render_png": os.environ.get("NEMO_RL_SANDBOX_OBSERVABILITY_RENDER_PNG", "1")
-            != "0",
+            "enabled": os.environ.get("NEMO_RL_SANDBOX_OBSERVABILITY_ARTIFACTS", "1") != "0",
+            "render_html": os.environ.get("NEMO_RL_SANDBOX_OBSERVABILITY_RENDER_HTML", "1") != "0",
+            "render_png": os.environ.get("NEMO_RL_SANDBOX_OBSERVABILITY_RENDER_PNG", "1") != "0",
             "export_otlp_json": os.environ.get(
                 "NEMO_RL_SANDBOX_OBSERVABILITY_EXPORT_OTLP_JSON",
                 "1",
@@ -1172,13 +1139,10 @@ def build_recorder_from_env() -> SandboxEventRecorder | None:
                 "nemo-rl-sandbox-eval",
             ),
             "endpoint": os.environ.get("NEMO_RL_SANDBOX_OBSERVABILITY_OTEL_ENDPOINT"),
-            "export_logs": os.environ.get("NEMO_RL_SANDBOX_OBSERVABILITY_OTEL_LOGS", "0")
-            == "1",
+            "export_logs": os.environ.get("NEMO_RL_SANDBOX_OBSERVABILITY_OTEL_LOGS", "0") == "1",
         },
         wandb={
-            "enabled": _env_wandb_enabled(
-                os.environ.get("NEMO_RL_SANDBOX_OBSERVABILITY_WANDB", "auto")
-            ),
+            "enabled": _env_wandb_enabled(os.environ.get("NEMO_RL_SANDBOX_OBSERVABILITY_WANDB", "auto")),
             "artifact_name": os.environ.get(
                 "NEMO_RL_SANDBOX_OBSERVABILITY_WANDB_ARTIFACT",
                 "sandbox-observability",

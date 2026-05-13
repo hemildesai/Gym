@@ -12,36 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Harbor integration for Approach A sandbox trajectories."""
+"""Harbor environment backed by the public NeMo Gym sandbox API."""
 
 import asyncio
-from collections.abc import Iterator
-from contextlib import contextmanager
-from copy import deepcopy
-from dataclasses import dataclass, field
 import hashlib
 import inspect
-from importlib import resources
 import json
 import logging
 import os
-from pathlib import Path, PurePosixPath
 import re
 import shlex
 import tarfile
 import tempfile
 import time
 import tomllib
+from collections.abc import Iterator
+from contextlib import contextmanager
+from copy import deepcopy
+from dataclasses import dataclass, field
+from importlib import resources
+from pathlib import Path, PurePosixPath
 from typing import Any, cast
 from uuid import uuid4
 
-from nemo_gym.sandbox.config import SandboxConfig, SandboxProviderConfig
-from nemo_gym.sandbox.integrations.policy_proxy import (
-    POLICY_PROXY_SCRIPT,
-    SandboxTrajectory,
-    load_policy_trace_jsonl,
+from nemo_gym.sandbox import (
+    Sandbox,
+    SandboxBatchCreateError,
+    SandboxCreateVerificationError,
+    SandboxHandle,
+    SandboxSpec,
 )
-from nemo_gym.sandbox.integrations.trajectory import SandboxRolloutContext
+from nemo_gym.sandbox.config import SandboxProviderConfig
 from nemo_gym.sandbox.observability import (
     SandboxResourceSampler,
     build_recorder_from_config,
@@ -58,13 +59,15 @@ from nemo_gym.sandbox.observability import (
     use_recorder,
 )
 from nemo_gym.sandbox.observability.render import safe_report_name
-from nemo_gym.sandbox.providers import SandboxHandle, SandboxSpec, create_provider
-from nemo_gym.sandbox.providers.opensandbox import (
-    OpenSandboxBatchCreateError,
-    OpenSandboxCreateVerificationError,
+from responses_api_agents.harbor_agent.trajectory import (
+    SandboxRolloutContext,
+    SandboxTrajectory,
+    load_policy_trace_jsonl,
 )
 
+
 G_LOGGER = logging.getLogger(__name__)
+SandboxConfig = dict[str, Any]
 
 
 def _require_harbor() -> dict[str, Any]:
@@ -72,12 +75,12 @@ def _require_harbor() -> dict[str, Any]:
         from harbor.environments.base import BaseSandbox, ExecResult
         from harbor.models.trial.config import TrialConfig
         from harbor.models.trial.paths import EnvironmentPaths
-        from harbor.trial.trial import Trial
         from harbor.trial.hooks import TrialEvent
+        from harbor.trial.trial import Trial
     except ModuleNotFoundError as e:
         raise ModuleNotFoundError(
-            "Harbor is required for env.sandbox.integration.name=harbor. "
-            "Install the Harbor PR #1291 branch in the NeMo-RL runtime image."
+            "Harbor is required for the Gym harbor_agent sandbox environment. "
+            "Install Harbor in the runtime image before using this agent."
         ) from e
 
     return {
@@ -91,7 +94,7 @@ def _require_harbor() -> dict[str, Any]:
 
 
 class _SandboxTypeValue:
-    value = "opensandbox"
+    value = "sandbox"
 
 
 _OPENSANDBOX_METADATA_VALUE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -183,9 +186,7 @@ def _preallocated_handle_reference(
     if make_reference is None:
         return handle
     reference = make_reference(handle)
-    if isinstance(reference, dict) and (
-        prepared_environment or policy_proxy_started
-    ):
+    if isinstance(reference, dict) and (prepared_environment or policy_proxy_started):
         reference = dict(reference)
         if prepared_environment:
             reference[_PREALLOCATED_ENVIRONMENT_PREPARED_KEY] = True
@@ -196,18 +197,12 @@ def _preallocated_handle_reference(
 
 def _preallocated_handle_environment_prepared(value: Any) -> bool:
     """Return whether deterministic environment setup was done in prewarm."""
-    return bool(
-        isinstance(value, dict)
-        and value.get(_PREALLOCATED_ENVIRONMENT_PREPARED_KEY, False)
-    )
+    return bool(isinstance(value, dict) and value.get(_PREALLOCATED_ENVIRONMENT_PREPARED_KEY, False))
 
 
 def _preallocated_handle_policy_proxy_started(value: Any) -> bool:
     """Return whether the policy proxy was started during prewarm."""
-    return bool(
-        isinstance(value, dict)
-        and value.get(_PREALLOCATED_POLICY_PROXY_STARTED_KEY, False)
-    )
+    return bool(isinstance(value, dict) and value.get(_PREALLOCATED_POLICY_PROXY_STARTED_KEY, False))
 
 
 async def _materialize_preallocated_handle(
@@ -221,22 +216,21 @@ async def _materialize_preallocated_handle(
     materialize = getattr(provider, "materialize_handle", None)
     if materialize is None:
         raise ValueError(
-            "This sandbox provider cannot materialize preallocated handle "
-            f"references: {type(provider).__name__}"
+            f"This sandbox provider cannot materialize preallocated handle references: {type(provider).__name__}"
         )
     result = materialize(value)
     if inspect.isawaitable(result):
         result = await result
     if not isinstance(result, SandboxHandle):
-        raise TypeError(
-            "materialize_handle must return SandboxHandle, got "
-            f"{type(result).__name__}"
-        )
+        raise TypeError(f"materialize_handle must return SandboxHandle, got {type(result).__name__}")
     return result
+
+
 _PROGRESS_PROBE_SCRIPT = (
-    resources.files("nemo_gym.sandbox.integrations")
-    .joinpath("sandbox_progress_probe.py")
-    .read_text(encoding="utf-8")
+    resources.files("responses_api_agents.harbor_agent").joinpath("progress_probe.py").read_text(encoding="utf-8")
+)
+_POLICY_PROXY_SCRIPT = (
+    resources.files("responses_api_agents.harbor_agent").joinpath("policy_proxy_server.py").read_text(encoding="utf-8")
 )
 _PROGRESS_PROBE_PATH = "/tmp/nemo_rl_sandbox_progress_probe.py"
 _POLICY_PROXY_OBSERVABILITY_EVENTS_FILE = "nemo_rl_observability_events.jsonl"
@@ -276,11 +270,7 @@ def _is_agent_log_transfer(target_dir: str) -> bool:
 
 
 def _should_skip_agent_log_transfer(relative_path: str | PurePosixPath) -> bool:
-    return bool(
-        _AGENT_LOG_TRANSFER_EXCLUDED_PARTS.intersection(
-            PurePosixPath(relative_path).parts
-        )
-    )
+    return bool(_AGENT_LOG_TRANSFER_EXCLUDED_PARTS.intersection(PurePosixPath(relative_path).parts))
 
 
 async def _exec_provider_checked(
@@ -289,7 +279,7 @@ async def _exec_provider_checked(
     command: str,
     *,
     phase: str,
-    cwd: str | None = None,
+    cwd: str | None = "/",
     env: dict[str, str] | None = None,
     timeout_s: int | None = None,
     user: str | int | None = None,
@@ -342,9 +332,7 @@ def _iter_upload_paths(
             dir_names[:] = [
                 dirname
                 for dirname in dir_names
-                if not _should_skip_agent_log_transfer(
-                    PurePosixPath(relative_dir.as_posix()) / dirname
-                )
+                if not _should_skip_agent_log_transfer(PurePosixPath(relative_dir.as_posix()) / dirname)
             ]
         for file_name in file_names:
             local_path = Path(dir_path) / file_name
@@ -368,9 +356,7 @@ async def _upload_dir_tar_to_handle(
     archive_remote_path = f"/tmp/nemo_rl_upload_{uuid4().hex}.tar.gz"
     with tempfile.NamedTemporaryFile(suffix=".tar.gz") as archive:
         with tarfile.open(archive.name, mode="w:gz") as tar:
-            for local_path, relative_path in _iter_upload_paths(
-                source_root, skip_agent_caches=skip_agent_caches
-            ):
+            for local_path, relative_path in _iter_upload_paths(source_root, skip_agent_caches=skip_agent_caches):
                 tar.add(local_path, arcname=relative_path.as_posix(), recursive=False)
         archive.flush()
         await provider.upload_file(handle, Path(archive.name), archive_remote_path)
@@ -393,8 +379,7 @@ async def _upload_dir_tar_to_handle(
         cwd="/",
     )
     G_LOGGER.warning(
-        "Falling back to per-file sandbox directory upload; tar upload failed "
-        "with exit %s; stdout=%s; stderr=%s",
+        "Falling back to per-file sandbox directory upload; tar upload failed with exit %s; stdout=%s; stderr=%s",
         result.return_code,
         (result.stdout or "")[:500],
         (result.stderr or "")[:500],
@@ -409,9 +394,7 @@ async def _upload_dir_file_by_file(
     target_dir: str,
 ) -> None:
     skip_agent_caches = _is_agent_log_transfer(target_dir)
-    for local_path, relative_path in _iter_upload_paths(
-        source_root, skip_agent_caches=skip_agent_caches
-    ):
+    for local_path, relative_path in _iter_upload_paths(source_root, skip_agent_caches=skip_agent_caches):
         remote_path = str(PurePosixPath(target_dir) / relative_path)
         await _exec_provider_checked(
             provider,
@@ -502,7 +485,7 @@ async def start_policy_proxy_for_handle(
     trace_path = policy_proxy_config["trace_path"]
     port = policy_proxy_config["port"]
     pid_path = "/tmp/nemo-rl-policy-proxy.pid"
-    await provider.write_file(handle, script_path, POLICY_PROXY_SCRIPT)
+    await provider.write_file(handle, script_path, _POLICY_PROXY_SCRIPT)
     command = (
         f"python3 {shlex.quote(script_path)} "
         "--target-base-url "
@@ -514,20 +497,11 @@ async def start_policy_proxy_for_handle(
     if "backend" in policy_proxy_config:
         command += f" --backend {shlex.quote(str(policy_proxy_config['backend']))}"
     if "litellm_provider" in policy_proxy_config:
-        command += (
-            " --litellm-provider "
-            f"{shlex.quote(str(policy_proxy_config['litellm_provider']))}"
-        )
+        command += f" --litellm-provider {shlex.quote(str(policy_proxy_config['litellm_provider']))}"
     if "upstream_model_name" in policy_proxy_config:
-        command += (
-            " --upstream-model-name "
-            f"{shlex.quote(str(policy_proxy_config['upstream_model_name']))}"
-        )
+        command += f" --upstream-model-name {shlex.quote(str(policy_proxy_config['upstream_model_name']))}"
     if policy_proxy_config.get("generation_temperature") is not None:
-        command += (
-            " --generation-temperature "
-            f"{float(policy_proxy_config['generation_temperature'])}"
-        )
+        command += f" --generation-temperature {float(policy_proxy_config['generation_temperature'])}"
     if policy_proxy_config.get("generation_top_p") is not None:
         command += f" --generation-top-p {float(policy_proxy_config['generation_top_p'])}"
     if policy_proxy_config.get("generation_top_k") is not None:
@@ -537,49 +511,37 @@ async def start_policy_proxy_for_handle(
             policy_proxy_config["generation_chat_template_kwargs"],
             separators=(",", ":"),
         )
-        command += (
-            " --generation-chat-template-kwargs-json "
-            f"{shlex.quote(chat_template_kwargs)}"
-        )
+        command += f" --generation-chat-template-kwargs-json {shlex.quote(chat_template_kwargs)}"
     if policy_proxy_config.get("force_generation_params"):
         command += " --force-generation-params"
     if "responses_upstream_api" in policy_proxy_config:
-        command += (
-            " --responses-upstream-api "
-            f"{shlex.quote(str(policy_proxy_config['responses_upstream_api']))}"
-        )
-    command += (
-        " >/logs/agent/policy-proxy.log 2>&1 & "
-        f"echo $! >{shlex.quote(pid_path)}"
-    )
-    ready_probe = (
-        "python3 -c "
-        + shlex.quote(
-            "import os, socket, sys, time\n"
-            f"port = {int(port)}\n"
-            f"pid_path = {pid_path!r}\n"
-            "deadline = time.monotonic() + 10.0\n"
-            "pid = None\n"
-            "while time.monotonic() < deadline:\n"
-            "    if pid is None:\n"
-            "        try:\n"
-            "            with open(pid_path, 'r', encoding='utf-8') as f:\n"
-            "                pid = int(f.read().strip())\n"
-            "        except Exception:\n"
-            "            pid = None\n"
-            "    try:\n"
-            "        with socket.create_connection(('127.0.0.1', port), 0.2):\n"
-            "            sys.exit(0)\n"
-            "    except OSError:\n"
-            "        pass\n"
-            "    if pid is not None:\n"
-            "        try:\n"
-            "            os.kill(pid, 0)\n"
-            "        except OSError:\n"
-            "            sys.exit(2)\n"
-            "    time.sleep(0.05)\n"
-            "sys.exit(1)\n"
-        )
+        command += f" --responses-upstream-api {shlex.quote(str(policy_proxy_config['responses_upstream_api']))}"
+    command += f" >/logs/agent/policy-proxy.log 2>&1 & echo $! >{shlex.quote(pid_path)}"
+    ready_probe = "python3 -c " + shlex.quote(
+        "import os, socket, sys, time\n"
+        f"port = {int(port)}\n"
+        f"pid_path = {pid_path!r}\n"
+        "deadline = time.monotonic() + 10.0\n"
+        "pid = None\n"
+        "while time.monotonic() < deadline:\n"
+        "    if pid is None:\n"
+        "        try:\n"
+        "            with open(pid_path, 'r', encoding='utf-8') as f:\n"
+        "                pid = int(f.read().strip())\n"
+        "        except Exception:\n"
+        "            pid = None\n"
+        "    try:\n"
+        "        with socket.create_connection(('127.0.0.1', port), 0.2):\n"
+        "            sys.exit(0)\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "    if pid is not None:\n"
+        "        try:\n"
+        "            os.kill(pid, 0)\n"
+        "        except OSError:\n"
+        "            sys.exit(2)\n"
+        "    time.sleep(0.05)\n"
+        "sys.exit(1)\n"
     )
     await _exec_provider_checked(
         provider,
@@ -637,12 +599,11 @@ async def install_policy_proxy_client_config_for_handle(
     )
 
 
-class OpenSandboxHarborSandbox(_BaseSandbox):
-    """Harbor ``BaseSandbox`` implemented through NeMo-RL's provider layer.
+class SandboxHarborEnvironment(_BaseSandbox):
+    """Harbor ``BaseSandbox`` implemented through NeMo Gym's sandbox layer.
 
-    Harbor is an integration here, not a provider. The underlying runtime/infra
-    provider remains the configured NeMo-RL sandbox provider, usually
-    ``opensandbox`` for this PoC.
+    Harbor owns the agent and verifier workflow. The underlying runtime and
+    infrastructure provider is the configured NeMo Gym sandbox provider.
     """
 
     def __init__(
@@ -667,13 +628,11 @@ class OpenSandboxHarborSandbox(_BaseSandbox):
         **kwargs: Any,
     ) -> None:
         if provider is None:
-            raise ValueError(
-                "OpenSandboxHarborSandbox requires environment.kwargs.provider"
-            )
+            raise ValueError("SandboxHarborEnvironment requires environment.kwargs.provider")
         if spec is None:
-            raise ValueError("OpenSandboxHarborSandbox requires environment.kwargs.spec")
+            raise ValueError("SandboxHarborEnvironment requires environment.kwargs.spec")
         self._provider_config = provider
-        self._provider = create_provider(provider)
+        self._sandbox = Sandbox(provider)
         self._spec_config = spec
         self._policy_proxy_config = policy_proxy
         self._environment_target_dir = environment_target_dir.rstrip("/") or "/app"
@@ -683,9 +642,7 @@ class OpenSandboxHarborSandbox(_BaseSandbox):
         self._default_cwd = default_cwd
         self._pool_ref_template = pool_ref_template
         self._verify_preallocated_handle = verify_preallocated_handle
-        self._fallback_create_for_preallocated_handle = (
-            fallback_create_for_preallocated_handle
-        )
+        self._fallback_create_for_preallocated_handle = fallback_create_for_preallocated_handle
         if start_probe_command is not None and start_probe_timeout_s <= 0:
             raise ValueError("start_probe_timeout_s must be > 0")
         if default_exec_timeout_s is not None and default_exec_timeout_s <= 0:
@@ -727,8 +684,7 @@ class OpenSandboxHarborSandbox(_BaseSandbox):
             docker_image = getattr(self.task_env_config, "docker_image", None)
             if docker_image is None:
                 raise ValueError(
-                    "OpenSandboxHarborSandbox requires spec.image, spec.snapshot_id, "
-                    "or task environment docker_image"
+                    "SandboxHarborEnvironment requires spec.image, spec.snapshot_id, or task environment docker_image"
                 )
 
     def _build_spec(self) -> SandboxSpec:
@@ -770,10 +726,7 @@ class OpenSandboxHarborSandbox(_BaseSandbox):
                     task_name=task_name,
                 )
             except KeyError as exc:
-                raise ValueError(
-                    "pool_ref_template may only reference {environment_name} "
-                    "and {task_name}"
-                ) from exc
+                raise ValueError("pool_ref_template may only reference {environment_name} and {task_name}") from exc
             extensions["poolRef"] = _kubernetes_dns_label(rendered_pool_ref)
 
         return SandboxSpec(
@@ -796,9 +749,7 @@ class OpenSandboxHarborSandbox(_BaseSandbox):
         if recorder is not None and current_recorder() is None:
             self._observability_recorder_token = set_current_recorder(recorder)
         attrs = {
-            "trajectory_id": self._observability_context.get(
-                "trajectory_id", self.environment_name
-            ),
+            "trajectory_id": self._observability_context.get("trajectory_id", self.environment_name),
             "harbor_session_id": self.session_id,
             "environment_name": self.environment_name,
             **self._observability_context,
@@ -826,7 +777,7 @@ class OpenSandboxHarborSandbox(_BaseSandbox):
         if self._handle is None or self._resource_sampler is not None:
             return
         self._resource_sampler = SandboxResourceSampler(
-            provider=self._provider,
+            provider=self._sandbox,
             handle=self._handle,
             recorder=recorder,
             interval_s=recorder.resource_sampler_interval_s(),
@@ -854,22 +805,15 @@ class OpenSandboxHarborSandbox(_BaseSandbox):
         ):
             if self._preallocated_handle_token is not None:
                 try:
-                    preallocated_value = _PREALLOCATED_HANDLES[
-                        self._preallocated_handle_token
-                    ]
+                    preallocated_value = _PREALLOCATED_HANDLES[self._preallocated_handle_token]
                 except KeyError as e:
                     raise ValueError(
-                        "Unknown preallocated OpenSandbox handle token "
-                        f"{self._preallocated_handle_token!r}"
+                        f"Unknown preallocated OpenSandbox handle token {self._preallocated_handle_token!r}"
                     ) from e
-                preallocated_environment_prepared = (
-                    _preallocated_handle_environment_prepared(preallocated_value)
-                )
-                preallocated_policy_proxy_started = (
-                    _preallocated_handle_policy_proxy_started(preallocated_value)
-                )
+                preallocated_environment_prepared = _preallocated_handle_environment_prepared(preallocated_value)
+                preallocated_policy_proxy_started = _preallocated_handle_policy_proxy_started(preallocated_value)
                 self._handle = await _materialize_preallocated_handle(
-                    self._provider,
+                    self._sandbox,
                     preallocated_value,
                 )
                 if self._verify_preallocated_handle:
@@ -886,18 +830,16 @@ class OpenSandboxHarborSandbox(_BaseSandbox):
                         )
                         self._handle = None
                         self._preallocated_handle_token = None
-                        self._handle = await self._provider.create(
-                            self._build_spec()
-                        )
+                        self._handle = await self._sandbox.create(self._build_spec())
                         preallocated_environment_prepared = False
                         preallocated_policy_proxy_started = False
             else:
-                self._handle = await self._provider.create(self._build_spec())
+                self._handle = await self._sandbox.create(self._build_spec())
             self._start_resource_sampler()
         async with observability_span("sandbox.setup", phase="setup"):
             if not preallocated_environment_prepared:
                 await prepare_harbor_sandbox_environment(
-                    provider=self._provider,
+                    provider=self._sandbox,
                     handle=self._require_handle(),
                     environment_dir=self.environment_dir,
                     environment_target_dir=self._environment_target_dir,
@@ -907,10 +849,7 @@ class OpenSandboxHarborSandbox(_BaseSandbox):
                     phase="setup",
                 )
             self._default_cwd_enabled = self._default_cwd is not None
-            if (
-                self._policy_proxy_config is not None
-                and not preallocated_policy_proxy_started
-            ):
+            if self._policy_proxy_config is not None and not preallocated_policy_proxy_started:
                 async with observability_span(
                     "sandbox.policy_proxy.start",
                     phase="setup",
@@ -959,8 +898,7 @@ class OpenSandboxHarborSandbox(_BaseSandbox):
             )
         except Exception as e:
             raise RuntimeError(
-                "OpenSandbox handle failed start probe command; "
-                f"command={self._start_probe_command!r}"
+                f"OpenSandbox handle failed start probe command; command={self._start_probe_command!r}"
             ) from e
 
         stdout = result.stdout or ""
@@ -976,9 +914,7 @@ class OpenSandboxHarborSandbox(_BaseSandbox):
     async def agent_progress_snapshot(self) -> dict[str, Any]:
         """Return a best-effort snapshot of agent progress inside the sandbox."""
         if not self._progress_probe_installed:
-            await self._provider.write_file(
-                self._require_handle(), _PROGRESS_PROBE_PATH, _PROGRESS_PROBE_SCRIPT
-            )
+            await self._sandbox.write_file(self._require_handle(), _PROGRESS_PROBE_PATH, _PROGRESS_PROBE_SCRIPT)
             self._progress_probe_installed = True
 
         result = await self.exec(
@@ -1013,13 +949,13 @@ class OpenSandboxHarborSandbox(_BaseSandbox):
                 if self._preallocated_handle_token is not None:
                     self._handle = None
                     return
-                await self._provider.close(
+                await self._sandbox.close(
                     self._handle,
                     delete=delete,
                 )
                 self._handle = None
         finally:
-            await _close_provider_resources(self._provider)
+            await _close_provider_resources(self._sandbox)
             self._deactivate_observability()
 
     async def prepare_logs_for_host(self) -> None:
@@ -1027,30 +963,30 @@ class OpenSandboxHarborSandbox(_BaseSandbox):
 
     def _require_handle(self) -> SandboxHandle:
         if self._handle is None:
-            raise RuntimeError("OpenSandboxHarborSandbox has not been started")
+            raise RuntimeError("SandboxHarborEnvironment has not been started")
         return self._handle
 
     async def _start_policy_proxy(self) -> None:
         await start_policy_proxy_for_handle(
-            self._provider,
+            self._sandbox,
             self._require_handle(),
             cast(dict[str, Any], self._policy_proxy_config),
         )
 
     async def _install_policy_proxy_client_config(self) -> None:
         await install_policy_proxy_client_config_for_handle(
-            self._provider,
+            self._sandbox,
             self._require_handle(),
             cast(dict[str, Any], self._policy_proxy_config),
         )
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
         source = Path(source_path)
-        await self._provider.upload_file(self._require_handle(), source, target_path)
+        await self._sandbox.upload_file(self._require_handle(), source, target_path)
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
         source_root = Path(source_dir)
-        await self.exec(f"mkdir -p {shlex.quote(target_dir)}", user="root")
+        await self.exec(f"mkdir -p {shlex.quote(target_dir)}", cwd="/", user="root")
         skip_agent_caches = _is_agent_log_transfer(target_dir)
         for dir_path, dir_names, file_names in os.walk(source_root):
             relative_dir = Path(dir_path).relative_to(source_root)
@@ -1058,9 +994,7 @@ class OpenSandboxHarborSandbox(_BaseSandbox):
                 dir_names[:] = [
                     dirname
                     for dirname in dir_names
-                    if not _should_skip_agent_log_transfer(
-                        PurePosixPath(relative_dir.as_posix()) / dirname
-                    )
+                    if not _should_skip_agent_log_transfer(PurePosixPath(relative_dir.as_posix()) / dirname)
                 ]
             for file_name in file_names:
                 local_path = Path(dir_path) / file_name
@@ -1068,29 +1002,24 @@ class OpenSandboxHarborSandbox(_BaseSandbox):
                     relative_path = PurePosixPath(file_name)
                 else:
                     relative_path = PurePosixPath(relative_dir.as_posix()) / file_name
-                if skip_agent_caches and _should_skip_agent_log_transfer(
-                    relative_path
-                ):
+                if skip_agent_caches and _should_skip_agent_log_transfer(relative_path):
                     continue
                 remote_path = str(PurePosixPath(target_dir) / relative_path)
                 await self.exec(
                     f"mkdir -p {shlex.quote(str(PurePosixPath(remote_path).parent))}",
+                    cwd="/",
                     user="root",
                 )
                 await self.upload_file(local_path, remote_path)
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
-        await self._provider.download_file(
-            self._require_handle(), source_path, Path(target_path)
-        )
+        await self._sandbox.download_file(self._require_handle(), source_path, Path(target_path))
 
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
         target = Path(target_dir)
         target.mkdir(parents=True, exist_ok=True)
         is_agent_log_transfer = _is_agent_log_transfer(source_dir)
-        result = await self.exec(
-            f"find {shlex.quote(source_dir)} -type f -print", user="root"
-        )
+        result = await self.exec(f"find {shlex.quote(source_dir)} -type f -print", cwd="/", user="root")
         if result.return_code != 0 or not result.stdout:
             return
         for remote_file in result.stdout.splitlines():
@@ -1101,9 +1030,7 @@ class OpenSandboxHarborSandbox(_BaseSandbox):
         if is_agent_log_transfer:
             recorder = current_recorder()
             if recorder is not None:
-                trajectory_id = self._observability_context.get(
-                    "trajectory_id", self.environment_name
-                )
+                trajectory_id = self._observability_context.get("trajectory_id", self.environment_name)
                 recorder.ingest_jsonl(
                     target / _POLICY_PROXY_OBSERVABILITY_EVENTS_FILE,
                     trajectory_id=trajectory_id,
@@ -1132,7 +1059,7 @@ class OpenSandboxHarborSandbox(_BaseSandbox):
             exec_cwd = self._default_cwd
         if timeout_sec is None:
             timeout_sec = self._default_exec_timeout_s
-        result = await self._provider.exec(
+        result = await self._sandbox.exec(
             self._require_handle(),
             command,
             cwd=exec_cwd,
@@ -1163,10 +1090,7 @@ def _format_config_value(value: Any, format_values: dict[str, str]) -> Any:
     if isinstance(value, list):
         return [_format_config_value(item, format_values) for item in value]
     if isinstance(value, dict):
-        return {
-            key: _format_config_value(item, format_values)
-            for key, item in value.items()
-        }
+        return {key: _format_config_value(item, format_values) for key, item in value.items()}
     return value
 
 
@@ -1179,9 +1103,7 @@ def _first_policy_base_url(context: SandboxRolloutContext) -> str:
     return context.base_urls[0]
 
 
-def _reward_from_result(
-    result: Any, sandbox_config: SandboxConfig
-) -> tuple[float, dict[str, float | int]]:
+def _reward_from_result(result: Any, sandbox_config: SandboxConfig) -> tuple[float, dict[str, float | int]]:
     rewards = None
     if result.verifier_result is not None:
         rewards = result.verifier_result.rewards
@@ -1199,9 +1121,7 @@ def _reward_from_result(
         value = next(iter(rewards.values()))
         return float(value), rewards
 
-    raise ValueError(
-        "Harbor verifier emitted multiple rewards. Set env.sandbox.trajectory.reward_key."
-    )
+    raise ValueError("Harbor verifier emitted multiple rewards. Set env.sandbox.trajectory.reward_key.")
 
 
 def _stop_reason_from_result(result: Any) -> str:
@@ -1223,7 +1143,7 @@ def _is_retryable_sandbox_runtime_error(exception: BaseException) -> bool:
             ConnectionError,
             TimeoutError,
             OSError,
-            OpenSandboxCreateVerificationError,
+            SandboxCreateVerificationError,
         ),
     ):
         return True
@@ -1251,12 +1171,8 @@ def _observability_artifacts(trajectory_id: str | None) -> dict[str, str] | None
     }
     if trajectory_id:
         report_stem = safe_report_name(trajectory_id)
-        artifacts["trajectory_html"] = str(
-            recorder.output_dir / "reports" / f"{report_stem}.html"
-        )
-        artifacts["trajectory_png"] = str(
-            recorder.output_dir / "reports" / f"{report_stem}.png"
-        )
+        artifacts["trajectory_html"] = str(recorder.output_dir / "reports" / f"{report_stem}.html")
+        artifacts["trajectory_png"] = str(recorder.output_dir / "reports" / f"{report_stem}.png")
     return artifacts
 
 
@@ -1328,9 +1244,7 @@ def _masked_trajectory(
         full_result["error_message"] = error_message
     if result is not None:
         full_result["result"] = result.model_dump(mode="json")
-    observability = _observability_artifacts(
-        getattr(trial_config, "trial_name", None)
-    )
+    observability = _observability_artifacts(getattr(trial_config, "trial_name", None))
     if observability is not None:
         full_result["observability"] = observability
 
@@ -1360,9 +1274,7 @@ def _file_snapshot_by_name(snapshot: dict[str, Any], name: str) -> dict[str, Any
     return {}
 
 
-def _first_file_snapshot_by_name(
-    snapshot: dict[str, Any], names: tuple[str, ...]
-) -> dict[str, Any]:
+def _first_file_snapshot_by_name(snapshot: dict[str, Any], names: tuple[str, ...]) -> dict[str, Any]:
     for name in names:
         file_snapshot = _file_snapshot_by_name(snapshot, name)
         if file_snapshot.get("exists"):
@@ -1401,11 +1313,7 @@ def _progress_fingerprint(snapshot: dict[str, Any]) -> str:
                 "policy_trace": file_snapshot.get("policy_trace"),
             }
         )
-    processes = [
-        process.get("cmdline")
-        for process in snapshot.get("processes", [])
-        if isinstance(process, dict)
-    ]
+    processes = [process.get("cmdline") for process in snapshot.get("processes", []) if isinstance(process, dict)]
     return json.dumps({"files": files, "processes": processes}, sort_keys=True)
 
 
@@ -1438,9 +1346,7 @@ class _ProgressMonitorState:
                 "snapshot_count": 0,
             }
         latest = self.snapshots[-1]
-        policy_trace = _file_snapshot_by_name(latest, "policy_trace.jsonl").get(
-            "policy_trace", {}
-        )
+        policy_trace = _file_snapshot_by_name(latest, "policy_trace.jsonl").get("policy_trace", {})
         return {
             "trial_name": self.trial_name,
             "snapshot_count": len(self.snapshots),
@@ -1569,18 +1475,11 @@ def _validate_harbor_config(sandbox_config: SandboxConfig) -> None:
     for required_key in ("trial_config", "environment_spec", "max_retries"):
         if required_key not in integration_kwargs:
             raise ValueError(
-                f"env.sandbox.integration.kwargs.{required_key} is required "
-                "for the Harbor sandbox integration"
+                f"env.sandbox.integration.kwargs.{required_key} is required for the Harbor sandbox integration"
             )
 
-    if "policy_proxy" not in integration_kwargs and not integration_kwargs.get(
-        "eval_only", False
-    ):
-        agent_kwargs = dict(
-            integration_kwargs["trial_config"]
-            .get("agent", {})
-            .get("kwargs", {})
-        )
+    if "policy_proxy" not in integration_kwargs and not integration_kwargs.get("eval_only", False):
+        agent_kwargs = dict(integration_kwargs["trial_config"].get("agent", {}).get("kwargs", {}))
         agent_kwargs.update(integration_kwargs.get("agent_kwargs", {}))
         if not agent_kwargs.get("collect_rollout_details", False):
             raise ValueError(
@@ -1596,13 +1495,8 @@ def _validate_harbor_config(sandbox_config: SandboxConfig) -> None:
 
     rate_limit_config = integration_kwargs.get("rate_limit", None)
     if isinstance(rate_limit_config, dict) and rate_limit_config.get("enabled", False):
-        trajectories_per_second = rate_limit_config.get(
-            "trajectories_per_second", None
-        )
-        if (
-            trajectories_per_second is not None
-            and float(trajectories_per_second) <= 0.0
-        ):
+        trajectories_per_second = rate_limit_config.get("trajectories_per_second", None)
+        if trajectories_per_second is not None and float(trajectories_per_second) <= 0.0:
             raise ValueError("rate_limit.trajectories_per_second must be > 0")
         max_concurrency = rate_limit_config.get("max_concurrency", None)
         if max_concurrency is not None and int(max_concurrency) < 1:
@@ -1623,9 +1517,7 @@ def _trial_config_for_row(
     config_dict = _deep_merge_dict(trial_template, row_override)
 
     environment_cfg = config_dict.setdefault("environment", {})
-    environment_cfg["import_path"] = (
-        "nemo_gym.sandbox.integrations.harbor:OpenSandboxHarborSandbox"
-    )
+    environment_cfg["import_path"] = "responses_api_agents.harbor_agent.sandbox:SandboxHarborEnvironment"
     environment_cfg["type"] = None
     environment_kwargs = environment_cfg.setdefault("kwargs", {})
     environment_kwargs["provider"] = sandbox_config["provider"]
@@ -1654,13 +1546,9 @@ def _trial_config_for_row(
     }
     agent_cfg = config_dict.setdefault("agent", {})
     if "model_name" in agent_cfg:
-        agent_cfg["model_name"] = _format_config_value(
-            agent_cfg["model_name"], format_values
-        )
+        agent_cfg["model_name"] = _format_config_value(agent_cfg["model_name"], format_values)
     if "agent_model_name" in integration_kwargs:
-        agent_cfg["model_name"] = _format_config_value(
-            integration_kwargs["agent_model_name"], format_values
-        )
+        agent_cfg["model_name"] = _format_config_value(integration_kwargs["agent_model_name"], format_values)
     if "agent_kwargs" in integration_kwargs:
         agent_kwargs = agent_cfg.setdefault("kwargs", {})
         for key, value in integration_kwargs["agent_kwargs"].items():
@@ -1668,9 +1556,7 @@ def _trial_config_for_row(
 
     if "policy_proxy" in integration_kwargs:
         proxy_config = integration_kwargs["policy_proxy"]
-        trace_path = str(
-            PurePosixPath("/logs/agent") / proxy_config["trace_file"]
-        )
+        trace_path = str(PurePosixPath("/logs/agent") / proxy_config["trace_file"])
         proxy_root_url = f"http://127.0.0.1:{proxy_config['port']}"
         proxy_base_url = f"http://127.0.0.1:{proxy_config['port']}/v1"
         format_values["proxy_root_url"] = proxy_root_url
@@ -1680,25 +1566,18 @@ def _trial_config_for_row(
             "port": proxy_config["port"],
             "trace_path": trace_path,
             "script_path": proxy_config["script_path"],
-            "env": {
-                key: _format_config_value(value, format_values)
-                for key, value in proxy_config["env"].items()
-            },
+            "env": {key: _format_config_value(value, format_values) for key, value in proxy_config["env"].items()},
         }
         if "backend" in proxy_config:
             environment_kwargs["policy_proxy"]["backend"] = proxy_config["backend"]
         if "litellm_provider" in proxy_config:
-            environment_kwargs["policy_proxy"]["litellm_provider"] = proxy_config[
-                "litellm_provider"
-            ]
+            environment_kwargs["policy_proxy"]["litellm_provider"] = proxy_config["litellm_provider"]
         if "upstream_model_name" in proxy_config:
-            environment_kwargs["policy_proxy"]["upstream_model_name"] = (
-                _format_config_value(proxy_config["upstream_model_name"], format_values)
+            environment_kwargs["policy_proxy"]["upstream_model_name"] = _format_config_value(
+                proxy_config["upstream_model_name"], format_values
             )
         if "responses_upstream_api" in proxy_config:
-            environment_kwargs["policy_proxy"]["responses_upstream_api"] = (
-                proxy_config["responses_upstream_api"]
-            )
+            environment_kwargs["policy_proxy"]["responses_upstream_api"] = proxy_config["responses_upstream_api"]
         for key in (
             "generation_temperature",
             "generation_top_p",
@@ -1710,26 +1589,20 @@ def _trial_config_for_row(
                 environment_kwargs["policy_proxy"][key] = proxy_config[key]
 
         if not agent_cfg.get("model_name") and "model_name" in proxy_config:
-            agent_cfg["model_name"] = proxy_config["model_name"].format(
-                **format_values
-            )
+            agent_cfg["model_name"] = proxy_config["model_name"].format(**format_values)
         agent_env = agent_cfg.setdefault("env", {})
         agent_env.update(environment_kwargs["policy_proxy"]["env"])
         if "agent_kwargs" in proxy_config:
             agent_kwargs = agent_cfg.setdefault("kwargs", {})
             for key, value in proxy_config["agent_kwargs"].items():
-                agent_kwargs.setdefault(
-                    key, _format_config_value(value, format_values)
-                )
+                agent_kwargs.setdefault(key, _format_config_value(value, format_values))
 
     if "pre_agent_setup_commands" in integration_kwargs:
         environment_kwargs["pre_agent_setup_commands"] = _format_config_value(
             integration_kwargs["pre_agent_setup_commands"], format_values
         )
     if "default_exec_timeout_s" in integration_kwargs:
-        environment_kwargs["default_exec_timeout_s"] = integration_kwargs[
-            "default_exec_timeout_s"
-        ]
+        environment_kwargs["default_exec_timeout_s"] = integration_kwargs["default_exec_timeout_s"]
 
     if "policy_endpoint_env" in integration_kwargs:
         agent_cfg = config_dict.setdefault("agent", {})
@@ -1744,9 +1617,7 @@ def _ingest_policy_proxy_observability(trial: Any) -> None:
     recorder = current_recorder()
     if recorder is None:
         return
-    events_path = (
-        trial._trial_paths.agent_dir / _POLICY_PROXY_OBSERVABILITY_EVENTS_FILE
-    )
+    events_path = trial._trial_paths.agent_dir / _POLICY_PROXY_OBSERVABILITY_EVENTS_FILE
     recorder.ingest_jsonl(
         events_path,
         trajectory_id=trial.config.trial_name,
@@ -1873,30 +1744,21 @@ async def _run_harbor_trial(
         rollout_details = None
         if result.agent_result is not None:
             rollout_details = result.agent_result.rollout_details
-        if (
-            not rollout_details
-            and "policy_proxy" in sandbox_config["integration"]["kwargs"]
-        ):
-            trace_file = sandbox_config["integration"]["kwargs"]["policy_proxy"][
-                "trace_file"
-            ]
+        if not rollout_details and "policy_proxy" in sandbox_config["integration"]["kwargs"]:
+            trace_file = sandbox_config["integration"]["kwargs"]["policy_proxy"]["trace_file"]
             trace_path = trial._trial_paths.agent_dir / trace_file
             if trace_path.exists():
                 rollout_details = load_policy_trace_jsonl(trace_path)
 
         if not rollout_details:
-            last_error_message = (
-                f"Harbor trial {result.trial_name} did not produce rollout_details"
-            )
+            last_error_message = f"Harbor trial {result.trial_name} did not produce rollout_details"
             continue
 
         if stop_reason == "context_length":
             reward = 0.0
             rewards = {}
         elif result.verifier_result is None:
-            last_error_message = (
-                f"Harbor trial {result.trial_name} did not produce verifier_result"
-            )
+            last_error_message = f"Harbor trial {result.trial_name} did not produce verifier_result"
             continue
         else:
             reward, rewards = _reward_from_result(result, sandbox_config)
@@ -1952,9 +1814,7 @@ async def _rate_limit(
     if "enabled" not in rate_limit_config or not rate_limit_config["enabled"]:
         return
 
-    trajectories_per_second = rate_limit_config.get(
-        "trajectories_per_second", None
-    )
+    trajectories_per_second = rate_limit_config.get("trajectories_per_second", None)
     if trajectories_per_second is None:
         return
 
@@ -2020,19 +1880,14 @@ def _policy_proxy_process_env(
         "proxy_root_url": f"http://127.0.0.1:{policy_proxy['port']}",
         "proxy_base_url": f"http://127.0.0.1:{policy_proxy['port']}/v1",
     }
-    return {
-        key: str(_format_config_value(value, format_values))
-        for key, value in proxy_env.items()
-    }
+    return {key: str(_format_config_value(value, format_values)) for key, value in proxy_env.items()}
 
 
 def _mask_failed_prompt_groups(
     trajectories: list[SandboxTrajectory],
     rows: list[dict[str, Any]],
 ) -> list[SandboxTrajectory]:
-    prompt_group_ids = [
-        _prompt_group_id(row, row_idx) for row_idx, row in enumerate(rows)
-    ]
+    prompt_group_ids = [_prompt_group_id(row, row_idx) for row_idx, row in enumerate(rows)]
     failed_groups = {
         group_id
         for group_id, trajectory in zip(prompt_group_ids, trajectories)
@@ -2075,11 +1930,7 @@ def _spec_from_environment_spec(spec_config: dict[str, Any]) -> SandboxSpec:
 
 
 def _task_environment_for_row(row: dict[str, Any]) -> dict[str, Any]:
-    task_path = (
-        row.get("harbor_trial_config", {})
-        .get("task", {})
-        .get("path", None)
-    )
+    task_path = row.get("harbor_trial_config", {}).get("task", {}).get("path", None)
     if task_path is None:
         return {}
 
@@ -2106,9 +1957,7 @@ def _preallocation_environment_spec(
 
     environments = [_task_environment_for_row(row) for row in rows]
     images = {
-        environment.get("docker_image")
-        for environment in environments
-        if environment.get("docker_image") is not None
+        environment.get("docker_image") for environment in environments if environment.get("docker_image") is not None
     }
     if not images:
         return spec_config
@@ -2159,19 +2008,11 @@ async def _close_preallocated_handles(
     provider: Any,
     handles: list[SandboxHandle],
     *,
-    delete_batch: bool,
+    delete: bool,
 ) -> None:
     if not handles:
         return
 
-    batch_names = {
-        handle.raw.batch_name
-        for handle in handles
-        if hasattr(handle.raw, "batch_name")
-    }
-    use_batch_delete = delete_batch and bool(batch_names) and hasattr(
-        provider, "delete_batch"
-    )
     close_concurrency = max(1, int(getattr(provider, "_batch_create_concurrency", 8)))
     close_semaphore = asyncio.Semaphore(close_concurrency)
 
@@ -2179,7 +2020,7 @@ async def _close_preallocated_handles(
         async with close_semaphore:
             return await provider.close(
                 handle,
-                delete=delete_batch and not use_batch_delete,
+                delete=delete,
             )
 
     close_results = await asyncio.gather(
@@ -2187,26 +2028,7 @@ async def _close_preallocated_handles(
         return_exceptions=True,
     )
 
-    delete_results: list[Any] = []
-    if use_batch_delete:
-        delete_semaphore = asyncio.Semaphore(close_concurrency)
-
-        async def _delete_one(batch_name: str) -> Any:
-            async with delete_semaphore:
-                return await provider.delete_batch(batch_name)
-
-        delete_results = list(
-            await asyncio.gather(
-                *(_delete_one(batch_name) for batch_name in batch_names),
-                return_exceptions=True,
-            )
-        )
-
-    cleanup_errors = [
-        result
-        for result in [*close_results, *delete_results]
-        if isinstance(result, Exception)
-    ]
+    cleanup_errors = [result for result in close_results if isinstance(result, Exception)]
     if cleanup_errors:
         raise RuntimeError(
             "Failed to clean up one or more preallocated sandbox handles: "
@@ -2232,7 +2054,7 @@ def _masked_preallocation_trajectories(
     rows: list[dict[str, Any]],
     sandbox_config: SandboxConfig,
     context: SandboxRolloutContext,
-    error: OpenSandboxBatchCreateError,
+    error: SandboxBatchCreateError,
 ) -> list[SandboxTrajectory]:
     return [
         _masked_trajectory(
@@ -2319,46 +2141,31 @@ def collect_harbor_trajectories(
                 )
 
         async def _run_rows(run_rows: list[dict[str, Any]]) -> list[SandboxTrajectory]:
-            async def _run_indexed(
-                row_idx: int, row: dict[str, Any]
-            ) -> tuple[int, SandboxTrajectory]:
+            async def _run_indexed(row_idx: int, row: dict[str, Any]) -> tuple[int, SandboxTrajectory]:
                 return row_idx, await _run_row_guarded(row)
 
-            tasks = [
-                asyncio.create_task(_run_indexed(row_idx, row))
-                for row_idx, row in enumerate(run_rows)
-            ]
+            tasks = [asyncio.create_task(_run_indexed(row_idx, row)) for row_idx, row in enumerate(run_rows)]
             results: list[SandboxTrajectory | None] = [None] * len(run_rows)
             try:
                 for task in asyncio.as_completed(tasks):
                     row_idx, trajectory = await task
                     results[row_idx] = trajectory
-                    _append_checkpoint_trajectory(
-                        checkpoint_path, run_rows[row_idx], trajectory
-                    )
+                    _append_checkpoint_trajectory(checkpoint_path, run_rows[row_idx], trajectory)
             except BaseException:
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
                 raise
-            return [
-                trajectory
-                for trajectory in results
-                if trajectory is not None
-            ]
+            return [trajectory for trajectory in results if trajectory is not None]
 
         if integration_kwargs.get("preallocate_sandboxes", False):
-            provider = create_provider(sandbox_config["provider"])
+            provider = Sandbox(sandbox_config["provider"])
             try:
-                batch_size = _preallocate_batch_size(
-                    integration_kwargs, rate_limit_config, len(rows)
-                )
+                batch_size = _preallocate_batch_size(integration_kwargs, rate_limit_config, len(rows))
                 trajectories = []
                 for offset in range(0, len(rows), batch_size):
                     chunk = rows[offset : offset + batch_size]
-                    spec = _spec_from_environment_spec(
-                        _preallocation_environment_spec(chunk, integration_kwargs)
-                    )
+                    spec = _spec_from_environment_spec(_preallocation_environment_spec(chunk, integration_kwargs))
                     G_LOGGER.info(
                         "Preallocating sandbox chunk offset=%s size=%s total_rows=%s",
                         offset,
@@ -2379,7 +2186,7 @@ def collect_harbor_trajectories(
                                 len(chunk),
                                 allow_partial=True,
                             )
-                    except OpenSandboxBatchCreateError as e:
+                    except SandboxBatchCreateError as e:
                         G_LOGGER.warning(
                             "Failed to preallocate sandbox chunk offset=%s size=%s: %s",
                             offset,
@@ -2387,13 +2194,9 @@ def collect_harbor_trajectories(
                             e,
                         )
                         if integration_kwargs.get("mask_failed_preallocation", True):
-                            masked = _masked_preallocation_trajectories(
-                                chunk, sandbox_config, context, e
-                            )
+                            masked = _masked_preallocation_trajectories(chunk, sandbox_config, context, e)
                             for row, trajectory in zip(chunk, masked, strict=True):
-                                _append_checkpoint_trajectory(
-                                    checkpoint_path, row, trajectory
-                                )
+                                _append_checkpoint_trajectory(checkpoint_path, row, trajectory)
                             trajectories.extend(masked)
                             continue
                         raise
@@ -2410,7 +2213,7 @@ def collect_harbor_trajectories(
                     masked_partial: list[SandboxTrajectory] = []
                     if len(handles) < len(chunk):
                         failed_rows = chunk[len(handles) :]
-                        error = OpenSandboxBatchCreateError(
+                        error = SandboxBatchCreateError(
                             "OpenSandbox batch preallocation returned a partial "
                             f"chunk: requested={len(chunk)}, created={len(handles)}"
                         )
@@ -2420,12 +2223,8 @@ def collect_harbor_trajectories(
                     try:
                         trajectories.extend(await _run_rows(rows_with_handles))
                         if masked_partial:
-                            for row, trajectory in zip(
-                                chunk[len(handles) :], masked_partial, strict=True
-                            ):
-                                _append_checkpoint_trajectory(
-                                    checkpoint_path, row, trajectory
-                                )
+                            for row, trajectory in zip(chunk[len(handles) :], masked_partial, strict=True):
+                                _append_checkpoint_trajectory(checkpoint_path, row, trajectory)
                             trajectories.extend(masked_partial)
                     finally:
                         G_LOGGER.info(
@@ -2446,9 +2245,7 @@ def collect_harbor_trajectories(
                             await _close_preallocated_handles(
                                 provider,
                                 handles,
-                                delete_batch=integration_kwargs.get(
-                                    "delete_preallocated_batch", True
-                                ),
+                                delete=integration_kwargs.get("delete_preallocated_batch", True),
                             )
                         G_LOGGER.info(
                             "Cleaned preallocated sandbox chunk offset=%s size=%s",
@@ -2464,9 +2261,7 @@ def collect_harbor_trajectories(
             return _mask_failed_prompt_groups(trajectories, rows)
         return trajectories
 
-    with _temporary_process_env(
-        _policy_proxy_process_env(integration_kwargs, context)
-    ):
+    with _temporary_process_env(_policy_proxy_process_env(integration_kwargs, context)):
         try:
             with use_recorder(owned_recorder):
                 return asyncio.run(_collect())

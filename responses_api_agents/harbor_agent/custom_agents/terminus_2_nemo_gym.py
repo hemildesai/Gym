@@ -12,20 +12,155 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
+import base64
 import json
+import shlex
+import time
 from pathlib import Path
 from typing import Any, Literal
 
 from harbor.agents.terminus_2.terminus_2 import Terminus2
+from harbor.agents.terminus_2.tmux_session import TmuxSession
 from harbor.environments.base import BaseSandbox
 from harbor.llms.base import BaseLLM, LLMBackend
 from harbor.models.agent.context import AgentContext
+from harbor.models.trial.paths import EnvironmentPaths
 
 from responses_api_agents.harbor_agent.custom_agents.llms.nemo_gym_llm import NemoGymLLM
 
 
 class MemoryLimitExceededError(Exception):
     """Compatibility shim for non-Singularity Harbor environments."""
+
+
+class GymTmuxSession(TmuxSession):
+    """Tmux session variant that pastes literal text instead of flag-like keys."""
+
+    _TMUX_LITERAL_CHUNK_SIZE = 4096
+    _TMUX_CONTROL_CWD = "/"
+    _TMUX_SPECIAL_KEYS = {
+        "BSpace",
+        "C-c",
+        "C-d",
+        "Delete",
+        "Down",
+        "End",
+        "Escape",
+        "Home",
+        "Left",
+        "PageDown",
+        "PageUp",
+        "Right",
+        "Space",
+        "Tab",
+        "Up",
+    }
+
+    def _tmux_send_keys(self, keys: list[str]) -> list[str]:
+        """Build tmux commands, avoiding ``send-keys`` for arbitrary text."""
+        commands: list[str] = []
+        for key in keys:
+            if self._is_special_tmux_key(key):
+                commands.append(
+                    "tmux send-keys -t "
+                    + shlex.quote(self._session_name)
+                    + " "
+                    + shlex.quote(key)
+                )
+            else:
+                commands.extend(self._tmux_paste_literal(key))
+        return commands
+
+    def _is_special_tmux_key(self, key: str) -> bool:
+        return key in self._ENTER_KEYS or key in self._TMUX_SPECIAL_KEYS or key.startswith(("C-", "M-"))
+
+    def _tmux_paste_literal(self, text: str) -> list[str]:
+        commands = []
+        for index in range(0, len(text), self._TMUX_LITERAL_CHUNK_SIZE):
+            chunk = text[index : index + self._TMUX_LITERAL_CHUNK_SIZE]
+            encoded = base64.b64encode(chunk.encode("utf-8")).decode("ascii")
+            buffer_name = f"nemo-gym-keys-{abs(hash((self._session_name, index)))}"
+            commands.append(
+                "printf %s "
+                + shlex.quote(encoded)
+                + " | base64 -d | tmux load-buffer -b "
+                + shlex.quote(buffer_name)
+                + " - && tmux paste-buffer -b "
+                + shlex.quote(buffer_name)
+                + " -t "
+                + shlex.quote(self._session_name)
+                + " && tmux delete-buffer -b "
+                + shlex.quote(buffer_name)
+            )
+        return commands
+
+    async def is_session_alive(self) -> bool:
+        result = await self.environment.exec(
+            command="tmux has-session -t {}".format(self._session_name),
+            user=self._user,
+            cwd=self._TMUX_CONTROL_CWD,
+        )
+        return result.return_code == 0
+
+    async def _send_blocking_keys(
+        self,
+        keys: list[str],
+        max_timeout_sec: float,
+    ) -> None:
+        start_time_sec = time.time()
+
+        for command in self._tmux_send_keys(keys):
+            result = await self.environment.exec(
+                command=command,
+                user=self._user,
+                cwd=self._TMUX_CONTROL_CWD,
+            )
+            if result.return_code != 0:
+                raise RuntimeError(
+                    f"{self.environment.session_id}: failed to send blocking keys: {result.stderr}"
+                )
+
+        result = await self.environment.exec(
+            f"timeout {max_timeout_sec}s tmux wait done",
+            user=self._user,
+            cwd=self._TMUX_CONTROL_CWD,
+        )
+        if result.return_code != 0:
+            raise TimeoutError(f"Command timed out after {max_timeout_sec} seconds")
+
+        elapsed_time_sec = time.time() - start_time_sec
+        self._logger.debug(f"Blocking command completed in {elapsed_time_sec:.2f}s.")
+
+    async def _send_non_blocking_keys(
+        self,
+        keys: list[str],
+        min_timeout_sec: float,
+    ) -> None:
+        start_time_sec = time.time()
+
+        for command in self._tmux_send_keys(keys):
+            result = await self.environment.exec(
+                command=command,
+                user=self._user,
+                cwd=self._TMUX_CONTROL_CWD,
+            )
+            if result.return_code != 0:
+                raise RuntimeError(
+                    f"{self.environment.session_id}: failed to send non-blocking keys: {result.stderr}"
+                )
+
+        elapsed_time_sec = time.time() - start_time_sec
+        if elapsed_time_sec < min_timeout_sec:
+            await asyncio.sleep(min_timeout_sec - elapsed_time_sec)
+
+    async def capture_pane(self, capture_entire: bool = False) -> str:
+        result = await self.environment.exec(
+            self._tmux_capture_pane(capture_entire=capture_entire),
+            user=self._user,
+            cwd=self._TMUX_CONTROL_CWD,
+        )
+        return result.stdout or ""
 
 
 class Terminus2NemoGym(Terminus2):
@@ -120,6 +255,27 @@ class Terminus2NemoGym(Terminus2):
         if self._provided_nemo_gym_llm is None:
             raise ValueError("Terminus2NemoGym LLM was not initialized")
         return self._provided_nemo_gym_llm
+
+    async def setup(self, environment: BaseSandbox) -> None:
+        if self._record_terminal_session:
+            local_recording_path = environment.trial_paths.agent_dir / "recording.cast"
+            remote_recording_path = EnvironmentPaths.agent_dir / "recording.cast"
+        else:
+            local_recording_path = None
+            remote_recording_path = None
+
+        self._session = GymTmuxSession(
+            session_name=self.name(),
+            environment=environment,
+            logging_path=EnvironmentPaths.agent_dir / "terminus_2.pane",
+            local_asciinema_recording_path=local_recording_path,
+            remote_asciinema_recording_path=remote_recording_path,
+            pane_width=self._tmux_pane_width,
+            pane_height=self._tmux_pane_height,
+            extra_env=self._extra_env,
+            user=environment.default_user,
+        )
+        await self._session.start()
 
     async def run(self, instruction: str, environment: BaseSandbox, context: AgentContext) -> None:
         """Override run() to gracefully handle agent errors.

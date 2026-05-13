@@ -12,27 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OpenSandbox Pool and BatchSandbox lifecycle helpers for eval jobs."""
+"""OpenSandbox Pool lifecycle helpers for eval jobs."""
 
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Sequence
 
 
 DEFAULT_DOMAIN = "opensandbox-server.opensandbox-system.svc.cluster.local"
 DEFAULT_NAMESPACE = "opensandbox"
-GROUP = "sandbox.opensandbox.io"
-VERSION = "v1alpha1"
-BATCHSANDBOX_PLURAL = "batchsandboxes"
 
 
 class OpenSandboxHttpError(RuntimeError):
@@ -543,77 +540,6 @@ def ensure_pool(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_kubernetes_client() -> tuple[Any, Any]:
-    try:
-        from kubernetes import client, config
-        from kubernetes.client.exceptions import ApiException
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "The kubernetes Python package is required for BatchSandbox cleanup."
-        ) from exc
-
-    try:
-        config.load_incluster_config()
-    except Exception:
-        config.load_kube_config()
-    return client.CustomObjectsApi(), ApiException
-
-
-def _delete_batchsandboxes(args: argparse.Namespace) -> dict[str, Any]:
-    api, api_exception = _load_kubernetes_client()
-    label_selector = f"run_id={args.run_id}"
-    listed = api.list_namespaced_custom_object(
-        GROUP,
-        VERSION,
-        args.namespace,
-        BATCHSANDBOX_PLURAL,
-        label_selector=label_selector,
-    )
-    names = [item["metadata"]["name"] for item in listed.get("items", [])]
-    deleted: list[str] = []
-    for name in names:
-        try:
-            api.delete_namespaced_custom_object(
-                GROUP,
-                VERSION,
-                args.namespace,
-                BATCHSANDBOX_PLURAL,
-                name,
-            )
-            deleted.append(name)
-        except api_exception as exc:
-            if exc.status != 404:
-                raise
-
-    if args.wait:
-        deadline = time.monotonic() + args.timeout_s
-        while time.monotonic() < deadline:
-            listed = api.list_namespaced_custom_object(
-                GROUP,
-                VERSION,
-                args.namespace,
-                BATCHSANDBOX_PLURAL,
-                label_selector=label_selector,
-            )
-            remaining = len(listed.get("items", []))
-            if remaining == 0:
-                break
-            print(
-                json.dumps(
-                    {
-                        "event": "batchsandbox.cleanup.wait",
-                        "run_id": args.run_id,
-                        "remaining": remaining,
-                    },
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
-            time.sleep(args.poll_s)
-
-    return {"listed": len(names), "deleted": len(deleted), "names": deleted}
-
-
 def _pool_names(args: argparse.Namespace) -> list[str]:
     names = list(args.pool_name or [])
     if args.pool_names_file:
@@ -630,7 +556,6 @@ def _pool_names(args: argparse.Namespace) -> list[str]:
 
 
 def cleanup(args: argparse.Namespace) -> int:
-    batch_result = _delete_batchsandboxes(args)
     pool_results: list[dict[str, Any]] = []
     if not args.keep_pools:
         for pool_name in _pool_names(args):
@@ -653,7 +578,6 @@ def cleanup(args: argparse.Namespace) -> int:
             {
                 "event": "opensandbox.cleanup",
                 "run_id": args.run_id,
-                "batchsandboxes": batch_result,
                 "pools": pool_results,
             },
             sort_keys=True,
@@ -725,13 +649,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     cleanup_parser = subparsers.add_parser("cleanup")
     _add_common_api_args(cleanup_parser)
     cleanup_parser.add_argument("--run-id", required=True)
-    cleanup_parser.add_argument("--namespace", default=DEFAULT_NAMESPACE)
     cleanup_parser.add_argument("--pool-name", action="append")
     cleanup_parser.add_argument("--pool-names-file")
     cleanup_parser.add_argument("--keep-pools", action="store_true")
-    cleanup_parser.add_argument("--wait", action="store_true")
-    cleanup_parser.add_argument("--timeout-s", type=float, default=180.0)
-    cleanup_parser.add_argument("--poll-s", type=float, default=5.0)
     cleanup_parser.set_defaults(func=cleanup)
 
     return parser.parse_args(argv)

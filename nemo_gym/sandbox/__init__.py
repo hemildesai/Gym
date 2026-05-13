@@ -12,4 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Sandbox providers and integrations for NeMo-RL trajectory collection."""
+"""Public sandbox API for NeMo Gym."""
+
+from nemo_gym.sandbox.api import Sandbox, rewrite_image
+from nemo_gym.sandbox.providers import (
+    SandboxBatchCreateError,
+    SandboxCreateVerificationError,
+    SandboxExecResult,
+    SandboxHandle,
+    SandboxProvider,
+    SandboxSpec,
+    create_provider,
+    get_provider_class,
+    list_providers,
+    register_provider,
+)
+
+
+__all__ = [
+    "Sandbox",
+    "SandboxBatchCreateError",
+    "SandboxCreateVerificationError",
+    "SandboxExecResult",
+    "SandboxHandle",
+    "SandboxProvider",
+    "SandboxSpec",
+    "create_provider",
+    "get_provider_class",
+    "list_providers",
+    "register_provider",
+    "rewrite_image",
+]

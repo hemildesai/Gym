@@ -15,6 +15,8 @@
 """Sandbox provider registry."""
 
 from nemo_gym.sandbox.providers.base import (
+    SandboxBatchCreateError,
+    SandboxCreateVerificationError,
     SandboxExecResult,
     SandboxHandle,
     SandboxProvider,
@@ -27,7 +29,10 @@ from nemo_gym.sandbox.providers.registry import (
     register_provider,
 )
 
+
 __all__ = [
+    "SandboxBatchCreateError",
+    "SandboxCreateVerificationError",
     "SandboxExecResult",
     "SandboxHandle",
     "SandboxProvider",

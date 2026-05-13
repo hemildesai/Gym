@@ -12,25 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Policy trace conversion helpers.
+"""Harbor sandbox trajectory and policy-trace conversion helpers.
 
-Installed agents can run unmodified inside the sandbox, but GRPO needs
+Installed agents can run unmodified inside a sandbox, but GRPO needs
 assistant token IDs and generation logprobs. A policy proxy or Harbor-managed
 LLM client should emit the shape consumed here.
 """
 
-from importlib import resources
 import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NotRequired, TypedDict
 
 
-POLICY_PROXY_SCRIPT = (
-    resources.files("nemo_gym.sandbox.integrations")
-    .joinpath("policy_proxy_server.py")
-    .read_text(encoding="utf-8")
-)
+@dataclass(frozen=True)
+class SandboxRolloutContext:
+    """Policy endpoint context supplied to sandbox-backed rollout consumers."""
+
+    model_name: str
+    base_urls: list[str | None]
 
 
 class RolloutDetail(TypedDict):
@@ -81,9 +81,7 @@ def load_policy_trace_jsonl(path: Path) -> list[RolloutDetail]:
             if record.get("prompt_token_ids") is not None:
                 rollout_detail["prompt_token_ids"].append(record["prompt_token_ids"])
             if record.get("completion_token_ids") is not None:
-                rollout_detail["completion_token_ids"].append(
-                    record["completion_token_ids"]
-                )
+                rollout_detail["completion_token_ids"].append(record["completion_token_ids"])
             if record.get("logprobs") is not None:
                 logprobs.append(record["logprobs"])
             if isinstance(record.get("extra"), dict):
@@ -107,9 +105,7 @@ def _validate_turn(
     if not prompt_ids:
         raise ValueError(f"Sandbox trajectory turn {turn_idx} has empty prompt tokens")
     if not completion_ids:
-        raise ValueError(
-            f"Sandbox trajectory turn {turn_idx} has empty completion tokens"
-        )
+        raise ValueError(f"Sandbox trajectory turn {turn_idx} has empty completion tokens")
     if logprobs is None:
         if require_trainable:
             raise ValueError(
@@ -137,9 +133,7 @@ def convert_rollout_details_to_message_log(
     as a fresh user prompt so assistant token/logprob ownership stays explicit.
     """
     if len(rollout_details) != 1:
-        raise ValueError(
-            "Sandbox PoC currently supports one linear rollout detail segment per trajectory"
-        )
+        raise ValueError("Sandbox PoC currently supports one linear rollout detail segment per trajectory")
     import torch
 
     rollout_detail = rollout_details[0]
@@ -147,14 +141,10 @@ def convert_rollout_details_to_message_log(
     completions = rollout_detail["completion_token_ids"]
     logprobs_by_turn = rollout_detail.get("logprobs", None)
     if len(prompts) != len(completions):
-        raise ValueError(
-            f"Sandbox trajectory has {len(prompts)} prompt turns and "
-            f"{len(completions)} completion turns"
-        )
+        raise ValueError(f"Sandbox trajectory has {len(prompts)} prompt turns and {len(completions)} completion turns")
     if logprobs_by_turn is not None and len(logprobs_by_turn) != len(completions):
         raise ValueError(
-            f"Sandbox trajectory has {len(completions)} completion turns and "
-            f"{len(logprobs_by_turn)} logprob turns"
+            f"Sandbox trajectory has {len(completions)} completion turns and {len(logprobs_by_turn)} logprob turns"
         )
 
     seen_token_ids: list[int] = []
@@ -190,9 +180,7 @@ def convert_rollout_details_to_message_log(
             "token_ids": torch.tensor(completion_ids, dtype=torch.long),
         }
         if turn_logprobs is not None:
-            assistant_message["generation_logprobs"] = torch.tensor(
-                turn_logprobs, dtype=torch.float32
-            )
+            assistant_message["generation_logprobs"] = torch.tensor(turn_logprobs, dtype=torch.float32)
         message_log.append(assistant_message)
 
         seen_token_ids = [*prompt_ids, *completion_ids]

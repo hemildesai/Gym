@@ -20,10 +20,10 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import signal
 import sys
 import time
+from pathlib import Path
 from typing import Any, Sequence
 
 from summarize_observability_metrics import summarize
@@ -103,10 +103,6 @@ def _flatten_metrics(
 
     duration_paths = {
         "startup_readiness": ("startup_breakdown_s", "sandbox_readiness"),
-        "startup_batchsandbox_create_cr": (
-            "startup_breakdown_s",
-            "batchsandbox_create_cr",
-        ),
         "startup_opensandbox_create_api": (
             "startup_breakdown_s",
             "opensandbox_create_api",
@@ -364,14 +360,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "startup_readiness_p99_s": _get_nested(
                     metrics,
                     ("startup_breakdown_s", "sandbox_readiness", "p99"),
-                ),
-                "batchsandbox_create_cr_p95_s": _get_nested(
-                    metrics,
-                    ("startup_breakdown_s", "batchsandbox_create_cr", "p95"),
-                ),
-                "batchsandbox_create_cr_p99_s": _get_nested(
-                    metrics,
-                    ("startup_breakdown_s", "batchsandbox_create_cr", "p99"),
                 ),
                 "environment_setup_p95_s": _get_nested(
                     metrics,

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Harbor installed-agent shims used by sandbox trajectory PoCs."""
+"""Harbor installed-agent shims used by Gym sandbox eval jobs."""
 
 import json
 import shlex
@@ -56,11 +56,7 @@ class NpmClaudeCode(ClaudeCode):
         )
         await self.exec_as_agent(
             environment,
-            command=(
-                "set -euo pipefail; "
-                f"npm install -g @anthropic-ai/claude-code{version}; "
-                "claude --version"
-            ),
+            command=(f"set -euo pipefail; npm install -g @anthropic-ai/claude-code{version}; claude --version"),
         )
 
 
@@ -160,10 +156,7 @@ class ConfiguredQwenCode(QwenCode):
         }
 
         if self.mcp_servers:
-            settings["mcpServers"] = {
-                server.name: _qwen_mcp_server_config(server)
-                for server in self.mcp_servers
-            }
+            settings["mcpServers"] = {server.name: _qwen_mcp_server_config(server) for server in self.mcp_servers}
 
         return settings
 

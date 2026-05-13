@@ -16,11 +16,11 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 import html
 import json
-from pathlib import Path
 import re
+from collections import defaultdict
+from pathlib import Path
 from typing import Any
 
 from nemo_gym.sandbox.observability.summary import load_jsonl
@@ -66,9 +66,7 @@ def _event_trajectory_id(event: dict[str, Any]) -> str | None:
 def _span_bars(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     bars = []
     has_semantic_tools = any(
-        event.get("event_type") == "span_end"
-        and event.get("name") in _SEMANTIC_TOOL_NAMES
-        for event in events
+        event.get("event_type") == "span_end" and event.get("name") in _SEMANTIC_TOOL_NAMES for event in events
     )
     for event in events:
         if event.get("event_type") != "span_end":
@@ -152,10 +150,7 @@ def _render_timeline_png(events: list[dict[str, Any]], output_path: Path, title:
         "other_bash",
     ]
     ax.legend(
-        handles=[
-            Patch(color=_CATEGORY_COLORS[key], label=_LEGEND_LABELS[key])
-            for key in legend_keys
-        ],
+        handles=[Patch(color=_CATEGORY_COLORS[key], label=_LEGEND_LABELS[key]) for key in legend_keys],
         loc="upper center",
         bbox_to_anchor=(0.5, -0.32),
         ncols=4,
@@ -181,9 +176,7 @@ def _render_aggregate_png(
         and isinstance((event.get("attributes") or {}).get("duration_s"), (int, float))
     ]
     memory_values = [
-        int(sample["memory_usage_bytes"])
-        for sample in resources
-        if isinstance(sample.get("memory_usage_bytes"), int)
+        int(sample["memory_usage_bytes"]) for sample in resources if isinstance(sample.get("memory_usage_bytes"), int)
     ]
     if not span_durations and not memory_values:
         return False
@@ -222,7 +215,7 @@ def _write_html(path: Path, title: str, body: str) -> None:
                 "<!doctype html>",
                 "<html>",
                 "<head>",
-                "<meta charset=\"utf-8\">",
+                '<meta charset="utf-8">',
                 f"<title>{html.escape(title)}</title>",
                 "<style>body{font-family:Arial,sans-serif;margin:24px;}"
                 "table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:6px;}"
@@ -273,19 +266,18 @@ def render_reports(
         )
         html_path = reports_dir / f"{stem}.html"
         if render_html:
-            image_html = f"<p><img src=\"{html.escape(png_path.name)}\"></p>" if png_written else ""
+            image_html = f'<p><img src="{html.escape(png_path.name)}"></p>' if png_written else ""
             _write_html(
                 html_path,
                 trajectory_id,
-                f"<h1>{html.escape(trajectory_id)}</h1>{image_html}"
-                f"<p>Events: {len(trajectory_events)}</p>",
+                f"<h1>{html.escape(trajectory_id)}</h1>{image_html}<p>Events: {len(trajectory_events)}</p>",
             )
             trajectory_links.append(html_path.name)
 
     if render_html:
-        aggregate_image = "<p><img src=\"aggregate.png\"></p>" if aggregate_png_written else ""
+        aggregate_image = '<p><img src="aggregate.png"></p>' if aggregate_png_written else ""
         rows = "\n".join(
-            f"<li><a href=\"{html.escape(link)}\">{html.escape(link.removesuffix('.html'))}</a></li>"
+            f'<li><a href="{html.escape(link)}">{html.escape(link.removesuffix(".html"))}</a></li>'
             for link in trajectory_links
         )
         _write_html(

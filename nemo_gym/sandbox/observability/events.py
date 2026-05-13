@@ -132,8 +132,7 @@ def safe_attributes(attributes: dict[str, Any] | None) -> dict[str, Any]:
             safe[key] = value
         elif isinstance(value, (list, tuple)):
             safe[key] = [
-                item if isinstance(item, (str, int, float, bool)) or item is None else str(item)
-                for item in value
+                item if isinstance(item, (str, int, float, bool)) or item is None else str(item) for item in value
             ]
         elif isinstance(value, dict):
             safe[key] = {

@@ -24,7 +24,6 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Literal, Optional
 from uuid import uuid4
 
-import ray
 from fastapi import Body, FastAPI
 from pydantic import BaseModel, ConfigDict, PrivateAttr
 
@@ -246,6 +245,34 @@ def _patch_litellm_model_list_compat() -> None:
 
 
 _RUNNER_EVENT_LOOP_LOCAL = threading.local()
+_RAY_MODULE: Any = None
+_RUNNER_RAY_REMOTE: Any = None
+
+
+def _get_ray() -> Any:
+    global _RAY_MODULE
+    if _RAY_MODULE is None:
+        import ray
+
+        _RAY_MODULE = ray
+    return _RAY_MODULE
+
+
+def _runner_ray_remote_impl(runner: Callable, params: dict[str, Any]) -> Any:
+    return runner(**params)
+
+
+def _get_runner_ray_remote() -> Any:
+    global _RUNNER_RAY_REMOTE
+    if _RUNNER_RAY_REMOTE is None:
+        ray = _get_ray()
+        _RUNNER_RAY_REMOTE = ray.remote(
+            scheduling_strategy="SPREAD",
+            runtime_env={
+                "py_executable": sys.executable,
+            },
+        )(_runner_ray_remote_impl)
+    return _RUNNER_RAY_REMOTE
 
 
 def _run_harbor_job_sync(job_config_dict: dict) -> str:
@@ -283,22 +310,14 @@ async def _run_harbor_job_with_backend(
             job_config_dict,
         )
     if backend == "ray":
+        ray = _get_ray()
+        runner_ray_remote = _get_runner_ray_remote()
         future = runner_ray_remote.options(num_cpus=runner_num_cpus).remote(
             _run_harbor_job_sync,
             {"job_config_dict": job_config_dict},
         )
         return await asyncio.to_thread(ray.get, future)
     raise ValueError(f"Unsupported Harbor runner_backend={backend!r}")
-
-
-@ray.remote(
-    scheduling_strategy="SPREAD",
-    runtime_env={
-        "py_executable": sys.executable,
-    },
-)
-def runner_ray_remote(runner: Callable, params: dict[str, Any]) -> Any:
-    return runner(**params)
 
 
 class HarborAgent(SimpleResponsesAPIAgent):
@@ -332,8 +351,10 @@ class HarborAgent(SimpleResponsesAPIAgent):
 
     def setup_webserver(self) -> FastAPI:
         app = FastAPI()
+        self.setup_session_middleware(app)
         app.post("/v1/responses")(self.responses)
         app.post("/run")(self.run)
+        app.post("/aggregate_metrics")(self.aggregate_metrics)
         app.post("/prewarm_sandboxes")(self.prewarm_sandboxes)
         app.post("/cleanup_prewarmed_sandboxes")(self.cleanup_prewarmed_sandboxes)
         app.get("/sandbox_pool_snapshot")(self.sandbox_pool_snapshot)
@@ -496,9 +517,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
                         key = borrowed_handle_key or preallocated_handle_token
                         async with self._sandbox_pool_lock:
                             self._sandbox_pool_release_failure_total += 1
-                            self._sandbox_pool_errors[key] = (
-                                f"{type(e).__name__}: {e}"
-                            )
+                            self._sandbox_pool_errors[key] = f"{type(e).__name__}: {e}"
                         print(f"Error releasing prewarmed sandbox {key}: {e}")
 
     async def prewarm_sandboxes(self, body: HarborSandboxPrewarmRequest = Body()) -> dict[str, Any]:
@@ -508,8 +527,9 @@ class HarborAgent(SimpleResponsesAPIAgent):
             raise ValueError("create_concurrency must be >= 1")
         if body.prepare_concurrency is not None and body.prepare_concurrency < 1:
             raise ValueError("prepare_concurrency must be >= 1")
+        request_inflight = 0
         async with self._sandbox_pool_lock:
-            if self._sandbox_pool_prewarm_inflight:
+            if body.replace_existing and self._sandbox_pool_prewarm_inflight:
                 raise RuntimeError("Sandbox prewarm is already running")
             if body.replace_existing:
                 await self._cleanup_prewarmed_sandboxes_locked(delete=True)
@@ -520,16 +540,8 @@ class HarborAgent(SimpleResponsesAPIAgent):
 
             concurrency = body.concurrency or self.config.concurrency
             pool_config = self._sandbox_pool_config()
-            create_concurrency = (
-                body.create_concurrency
-                or pool_config.get("create_concurrency")
-                or concurrency
-            )
-            prepare_concurrency = (
-                body.prepare_concurrency
-                or pool_config.get("prepare_concurrency")
-                or concurrency
-            )
+            create_concurrency = body.create_concurrency or pool_config.get("create_concurrency") or concurrency
+            prepare_concurrency = body.prepare_concurrency or pool_config.get("prepare_concurrency") or concurrency
             create_semaphore = asyncio.Semaphore(max(1, int(create_concurrency)))
             prepare_semaphore = asyncio.Semaphore(max(1, int(prepare_concurrency)))
             prepare_environment = self._sandbox_pool_prepare_environment(body)
@@ -558,21 +570,15 @@ class HarborAgent(SimpleResponsesAPIAgent):
                     continue
                 seen_pending_keys.add(key)
                 pending_by_instance_id.setdefault(item.instance_id, []).append((key, item))
-            self._sandbox_pool_prewarm_inflight = sum(
-                len(keyed_items)
-                for keyed_items in pending_by_instance_id.values()
-            )
+            request_inflight = sum(len(keyed_items) for keyed_items in pending_by_instance_id.values())
+            self._sandbox_pool_prewarm_inflight += request_inflight
 
         async def _prepare_handle(handle: Any, instance_id: str) -> None:
             async with prepare_semaphore:
                 await self._prepare_prewarmed_handle(
                     instance_id,
                     handle,
-                    policy_proxy_config=(
-                        policy_proxy_config
-                        if start_policy_proxy
-                        else None
-                    ),
+                    policy_proxy_config=(policy_proxy_config if start_policy_proxy else None),
                 )
 
         async def _prewarm_group(instance_id: str, keyed_items: list[tuple[str, HarborSandboxPrewarmItem]]) -> None:
@@ -587,13 +593,9 @@ class HarborAgent(SimpleResponsesAPIAgent):
                         allow_partial=False,
                     )
                 if len(handles) != len(keyed_items):
-                    raise RuntimeError(
-                        f"Expected {len(keyed_items)} prewarmed handles, got {len(handles)}"
-                    )
+                    raise RuntimeError(f"Expected {len(keyed_items)} prewarmed handles, got {len(handles)}")
                 if prepare_environment:
-                    await asyncio.gather(
-                        *(_prepare_handle(handle, instance_id) for handle in handles)
-                    )
+                    await asyncio.gather(*(_prepare_handle(handle, instance_id) for handle in handles))
                 async with self._sandbox_pool_lock:
                     for (key, _), handle in zip(keyed_items, handles):
                         token = uuid4().hex
@@ -610,14 +612,14 @@ class HarborAgent(SimpleResponsesAPIAgent):
             except Exception as e:
                 if handles:
                     try:
-                        from nemo_gym.sandbox.integrations.harbor import (
+                        from responses_api_agents.harbor_agent.sandbox import (
                             _close_preallocated_handles,
                         )
 
                         await _close_preallocated_handles(
                             provider,
                             handles,
-                            delete_batch=True,
+                            delete=True,
                         )
                     except Exception:
                         pass
@@ -634,7 +636,10 @@ class HarborAgent(SimpleResponsesAPIAgent):
             )
         finally:
             async with self._sandbox_pool_lock:
-                self._sandbox_pool_prewarm_inflight = 0
+                self._sandbox_pool_prewarm_inflight = max(
+                    0,
+                    self._sandbox_pool_prewarm_inflight - request_inflight,
+                )
 
         async with self._sandbox_pool_lock:
             self._sandbox_pool_errors.update(errors)
@@ -673,19 +678,10 @@ class HarborAgent(SimpleResponsesAPIAgent):
         async with self._sandbox_pool_lock:
             borrowed_items = list(self._sandbox_pool_borrowed_tokens.items())
             if requested_keys:
-                borrowed_items = [
-                    item for item in borrowed_items if item[0] in requested_keys
-                ]
+                borrowed_items = [item for item in borrowed_items if item[0] in requested_keys]
             selected_items = borrowed_items[:limit]
-            selected = [
-                (key, token, self._sandbox_pool_handles.get(token))
-                for key, token in selected_items
-            ]
-            missing = [
-                key
-                for key, token in selected_items
-                if token not in self._sandbox_pool_handles
-            ]
+            selected = [(key, token, self._sandbox_pool_handles.get(token)) for key, token in selected_items]
+            missing = [key for key, token in selected_items if token not in self._sandbox_pool_handles]
             provider = self._sandbox_pool_provider
 
         if provider is None:
@@ -695,16 +691,14 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 "errors": {"provider": "sandbox pool provider is not initialized"},
             }
 
-        progress_semaphore = asyncio.Semaphore(
-            self._sandbox_pool_progress_probe_concurrency()
-        )
+        progress_semaphore = asyncio.Semaphore(self._sandbox_pool_progress_probe_concurrency())
 
         async def _probe(key: str, token: str, handle_ref: Any) -> tuple[str, dict[str, Any]]:
             async with progress_semaphore:
                 if handle_ref is None:
                     return key, {"error": "handle_not_found"}
                 try:
-                    from nemo_gym.sandbox.integrations.harbor import (
+                    from responses_api_agents.harbor_agent.sandbox import (
                         _PROGRESS_PROBE_PATH,
                         _PROGRESS_PROBE_SCRIPT,
                     )
@@ -734,9 +728,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 except Exception as e:
                     return key, {"error": type(e).__name__, "message": str(e)}
 
-        progress_pairs = await asyncio.gather(
-            *(_probe(key, token, handle) for key, token, handle in selected)
-        )
+        progress_pairs = await asyncio.gather(*(_probe(key, token, handle) for key, token, handle in selected))
         return {
             "snapshot": self._sandbox_pool_snapshot_dict(),
             "progress": dict(progress_pairs),
@@ -836,7 +828,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
         trace_path = trial_dir / "agent" / trace_file
         if not trace_path.exists():
             return None
-        from nemo_gym.sandbox.integrations.policy_proxy import load_policy_trace_jsonl
+        from responses_api_agents.harbor_agent.trajectory import load_policy_trace_jsonl
 
         return list(load_policy_trace_jsonl(trace_path))
 
@@ -847,13 +839,10 @@ class HarborAgent(SimpleResponsesAPIAgent):
         return bool(self._sandbox_pool_config().get("enabled", False))
 
     def _sandbox_pool_acquire_policy(self) -> str:
-        policy = str(
-            self._sandbox_pool_config().get("acquire_policy", "direct_create")
-        ).lower()
+        policy = str(self._sandbox_pool_config().get("acquire_policy", "direct_create")).lower()
         if policy not in {"direct_create", "fail_fast"}:
             raise ValueError(
-                "sandbox_pool.acquire_policy must be either 'direct_create' "
-                f"or 'fail_fast', got {policy!r}"
+                f"sandbox_pool.acquire_policy must be either 'direct_create' or 'fail_fast', got {policy!r}"
             )
         return policy
 
@@ -958,7 +947,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
         prepared_environment: bool = False,
         policy_proxy_started: bool = False,
     ) -> None:
-        from nemo_gym.sandbox.integrations.harbor import (
+        from responses_api_agents.harbor_agent.sandbox import (
             _PREALLOCATED_HANDLES,
             _preallocated_handle_reference,
         )
@@ -976,7 +965,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
         self._sandbox_pool_handles[token] = handle_ref
 
     async def _sandbox_pool_materialize_handle(self, handle_ref: Any) -> Any:
-        from nemo_gym.sandbox.integrations.harbor import _materialize_preallocated_handle
+        from responses_api_agents.harbor_agent.sandbox import _materialize_preallocated_handle
 
         if self._sandbox_pool_provider is None:
             raise RuntimeError("Sandbox pool provider is not initialized")
@@ -985,14 +974,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
             handle_ref,
         )
 
-    @staticmethod
-    def _sandbox_pool_batch_name(handle_ref: Any) -> Optional[str]:
-        if isinstance(handle_ref, dict):
-            batch_name = handle_ref.get("batch_name")
-            return str(batch_name) if batch_name is not None else None
-        batch_name = getattr(getattr(handle_ref, "raw", None), "batch_name", None)
-        return str(batch_name) if batch_name is not None else None
-
     async def _release_prewarmed_handle(
         self,
         key: Optional[str],
@@ -1000,7 +981,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
         *,
         delete: bool,
     ) -> None:
-        from nemo_gym.sandbox.integrations.harbor import (
+        from responses_api_agents.harbor_agent.sandbox import (
             _PREALLOCATED_HANDLES,
             _close_preallocated_handles,
         )
@@ -1010,9 +991,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 borrowed_token = self._sandbox_pool_borrowed_tokens.get(key)
                 if borrowed_token is not None and borrowed_token != token:
                     return
-            for borrowed_key, borrowed_token in list(
-                self._sandbox_pool_borrowed_tokens.items()
-            ):
+            for borrowed_key, borrowed_token in list(self._sandbox_pool_borrowed_tokens.items()):
                 if borrowed_token == token:
                     key = borrowed_key
                     break
@@ -1022,33 +1001,25 @@ class HarborAgent(SimpleResponsesAPIAgent):
                     break
             handle_ref = self._sandbox_pool_handles.get(token)
             provider = self._sandbox_pool_provider
-            batch_name = self._sandbox_pool_batch_name(handle_ref)
-            batch_has_siblings = bool(
-                batch_name
-                and any(
-                    other_token != token
-                    and self._sandbox_pool_batch_name(other_handle_ref) == batch_name
-                    for other_token, other_handle_ref in self._sandbox_pool_handles.items()
-                )
-            )
 
         if handle_ref is None:
             async with self._sandbox_pool_lock:
                 self._sandbox_pool_stale_handle_total += 1
         elif provider is not None:
-            handle = await self._sandbox_pool_materialize_handle(handle_ref)
-            await _close_preallocated_handles(
-                provider,
-                [handle],
-                delete_batch=delete and not batch_has_siblings,
-            )
+            try:
+                handle = await self._sandbox_pool_materialize_handle(handle_ref)
+                await _close_preallocated_handles(
+                    provider,
+                    [handle],
+                    delete=delete,
+                )
+            except Exception as e:
+                print(f"Error releasing prewarmed sandbox {key or token}: {e}")
         async with self._sandbox_pool_lock:
             if key is not None:
                 self._sandbox_pool_borrowed_tokens.pop(key, None)
                 self._sandbox_pool_idle_tokens.pop(key, None)
-            for borrowed_key, borrowed_token in list(
-                self._sandbox_pool_borrowed_tokens.items()
-            ):
+            for borrowed_key, borrowed_token in list(self._sandbox_pool_borrowed_tokens.items()):
                 if borrowed_token == token:
                     self._sandbox_pool_borrowed_tokens.pop(borrowed_key, None)
             for idle_key, idle_token in list(self._sandbox_pool_idle_tokens.items()):
@@ -1059,13 +1030,13 @@ class HarborAgent(SimpleResponsesAPIAgent):
             _PREALLOCATED_HANDLES.pop(token, None)
 
     def _create_sandbox_pool_provider(self) -> Any:
-        from nemo_gym.sandbox.providers import create_provider
+        from nemo_gym.sandbox import Sandbox
 
         environment_kwargs = self.config.harbor_environment_kwargs or {}
         provider_config = environment_kwargs.get("provider")
         if provider_config is None:
             raise ValueError("harbor_environment_kwargs.provider is required for sandbox prewarm")
-        return create_provider(provider_config)
+        return Sandbox(provider_config)
 
     def _sandbox_pool_prepare_environment(self, body: HarborSandboxPrewarmRequest) -> bool:
         if body.prepare_environment is not None:
@@ -1093,7 +1064,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
         *,
         policy_proxy_config: Optional[dict[str, Any]] = None,
     ) -> None:
-        from nemo_gym.sandbox.integrations.harbor import (
+        from responses_api_agents.harbor_agent.sandbox import (
             install_policy_proxy_client_config_for_handle,
             prepare_harbor_sandbox_environment,
             start_policy_proxy_for_handle,
@@ -1135,8 +1106,9 @@ class HarborAgent(SimpleResponsesAPIAgent):
 
     def _build_sandbox_pool_spec(self, instance_id: str) -> Any:
         from harbor.models.task.config import TaskConfig
-        from nemo_gym.sandbox.integrations.harbor import _kubernetes_dns_label, _rewrite_sandbox_image
-        from nemo_gym.sandbox.providers import SandboxSpec
+
+        from nemo_gym.sandbox import SandboxSpec
+        from responses_api_agents.harbor_agent.sandbox import _kubernetes_dns_label, _rewrite_sandbox_image
 
         _, task_name = self._parse_instance_id(instance_id)
         task_dir = self._sandbox_pool_task_dir(instance_id)
@@ -1184,7 +1156,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
         )
 
     async def _cleanup_prewarmed_sandboxes_locked(self, *, delete: bool) -> int:
-        from nemo_gym.sandbox.integrations.harbor import (
+        from responses_api_agents.harbor_agent.sandbox import (
             _PREALLOCATED_HANDLES,
             _close_preallocated_handles,
             _close_provider_resources,
@@ -1194,14 +1166,25 @@ class HarborAgent(SimpleResponsesAPIAgent):
         handles = list(self._sandbox_pool_handles.values())
         tokens = list(self._sandbox_pool_handles.keys())
         if provider is not None and handles:
-            materialized_handles = await asyncio.gather(
-                *(self._sandbox_pool_materialize_handle(handle) for handle in handles)
+            materialized_results = await asyncio.gather(
+                *(self._sandbox_pool_materialize_handle(handle) for handle in handles),
+                return_exceptions=True,
             )
-            await _close_preallocated_handles(
-                provider,
-                list(materialized_handles),
-                delete_batch=delete,
-            )
+            materialized_handles = []
+            for token, result in zip(tokens, materialized_results):
+                if isinstance(result, Exception):
+                    print(f"Error materializing prewarmed sandbox {token}: {result}")
+                else:
+                    materialized_handles.append(result)
+            if materialized_handles:
+                try:
+                    await _close_preallocated_handles(
+                        provider,
+                        list(materialized_handles),
+                        delete=delete,
+                    )
+                except Exception as e:
+                    print(f"Error cleaning up prewarmed sandboxes: {e}")
         for token in tokens:
             _PREALLOCATED_HANDLES.pop(token, None)
         self._sandbox_pool_idle_tokens.clear()
@@ -1209,7 +1192,10 @@ class HarborAgent(SimpleResponsesAPIAgent):
         self._sandbox_pool_handles.clear()
         self._sandbox_pool_progress_probe_tokens.clear()
         if provider is not None:
-            await _close_provider_resources(provider)
+            try:
+                await _close_provider_resources(provider)
+            except Exception as e:
+                print(f"Error closing sandbox pool provider resources: {e}")
         self._sandbox_pool_provider = None
         return len(handles)
 
@@ -1230,11 +1216,15 @@ class HarborAgent(SimpleResponsesAPIAgent):
         policy_target_base_url: Optional[str],
     ) -> tuple[Optional[dict[str, Any]], dict[str, str], dict[str, str]]:
         if not self.config.harbor_policy_proxy:
-            return None, {}, {
-                "model_name": model_name,
-                "target_base_url": api_base,
-                "policy_base_url": policy_target_base_url or api_base,
-            }
+            return (
+                None,
+                {},
+                {
+                    "model_name": model_name,
+                    "target_base_url": api_base,
+                    "policy_base_url": policy_target_base_url or api_base,
+                },
+            )
 
         proxy_config = dict(self.config.harbor_policy_proxy)
         trace_file = str(proxy_config.get("trace_file", "policy_trace.jsonl"))
@@ -1342,9 +1332,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
             pool_config = self._sandbox_pool_config()
             environment_kwargs["preallocated_handle_token"] = preallocated_handle_token
             if "verify_preallocated_handle" in pool_config:
-                environment_kwargs["verify_preallocated_handle"] = bool(
-                    pool_config["verify_preallocated_handle"]
-                )
+                environment_kwargs["verify_preallocated_handle"] = bool(pool_config["verify_preallocated_handle"])
             if "fallback_create_for_preallocated_handle" in pool_config:
                 environment_kwargs["fallback_create_for_preallocated_handle"] = bool(
                     pool_config["fallback_create_for_preallocated_handle"]

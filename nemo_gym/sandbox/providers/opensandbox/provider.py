@@ -15,11 +15,12 @@
 """OpenSandbox provider implementation."""
 
 import asyncio
-from dataclasses import replace
 import logging
+import re
+import shlex
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
-import shlex
 from typing import Any, Awaitable, Callable
 
 from tenacity import (
@@ -30,31 +31,24 @@ from tenacity import (
     wait_random_exponential,
 )
 
-from nemo_gym.sandbox.providers.base import (
-    SandboxExecResult,
-    SandboxHandle,
-    SandboxSpec,
-)
-from nemo_gym.sandbox.providers.opensandbox.batchsandbox import (
-    BatchSandboxClient,
-    BatchSandboxReplica,
-    DEFAULT_BATCHSANDBOX_NAMESPACE,
-    DEFAULT_EXECD_IMAGE,
-    DEFAULT_EXECD_PORT,
-    batchsandbox_name,
-    build_batchsandbox_manifest,
-    endpoint_with_port,
-)
 from nemo_gym.sandbox.observability import (
     command_attributes,
     current_recorder,
     observability_span,
 )
+from nemo_gym.sandbox.providers.base import (
+    SandboxBatchCreateError,
+    SandboxCreateVerificationError,
+    SandboxExecResult,
+    SandboxHandle,
+    SandboxSpec,
+)
+
 
 LOGGER = logging.getLogger(__name__)
 
 
-class OpenSandboxBatchCreateError(RuntimeError):
+class OpenSandboxBatchCreateError(SandboxBatchCreateError):
     """Raised when a batch sandbox preallocation cannot be completed."""
 
 
@@ -62,7 +56,7 @@ class OpenSandboxCreateTimeoutError(TimeoutError):
     """Raised when OpenSandbox sandbox creation exceeds the client timeout."""
 
 
-class OpenSandboxCreateVerificationError(ConnectionError):
+class OpenSandboxCreateVerificationError(SandboxCreateVerificationError):
     """Raised when a newly-created sandbox cannot execute a probe command."""
 
 
@@ -93,6 +87,19 @@ RETRYABLE_ERROR_MARKERS = (
     "timed out",
     "timeout",
 )
+METADATA_VALUE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+DEFAULT_IMAGE_PULL_POLICY = "IfNotPresent"
+IMAGE_PULL_POLICY_EXTENSION_KEY = "imagePullPolicy"
+IMAGE_PULL_POLICY_ANNOTATION_EXTENSION_KEY = "opensandbox.extensions.image-pull-policy"
+VALID_IMAGE_PULL_POLICIES = {"Always", "IfNotPresent", "Never"}
+
+
+def validate_image_pull_policy(image_pull_policy: str) -> str:
+    """Validate a Kubernetes-compatible container image pull policy."""
+    if image_pull_policy not in VALID_IMAGE_PULL_POLICIES:
+        allowed = ", ".join(sorted(VALID_IMAGE_PULL_POLICIES))
+        raise ValueError(f"image_pull_policy must be one of: {allowed}")
+    return image_pull_policy
 
 
 def _require_opensandbox_sdk() -> tuple[Any, Any, Any, Any, Any]:
@@ -181,8 +188,7 @@ def _log_create_retry(retry_state: RetryCallState) -> None:
     exception = retry_state.outcome.exception() if retry_state.outcome else None
     sleep_s = retry_state.next_action.sleep if retry_state.next_action else None
     LOGGER.warning(
-        "Retrying OpenSandbox sandbox create after attempt %s; "
-        "next_sleep_s=%s; error=%r",
+        "Retrying OpenSandbox sandbox create after attempt %s; next_sleep_s=%s; error=%r",
         retry_state.attempt_number,
         sleep_s,
         exception,
@@ -193,8 +199,7 @@ def _log_operation_retry(retry_state: RetryCallState) -> None:
     exception = retry_state.outcome.exception() if retry_state.outcome else None
     sleep_s = retry_state.next_action.sleep if retry_state.next_action else None
     LOGGER.warning(
-        "Retrying OpenSandbox SDK operation after attempt %s; "
-        "next_sleep_s=%s; error=%r",
+        "Retrying OpenSandbox SDK operation after attempt %s; next_sleep_s=%s; error=%r",
         retry_state.attempt_number,
         sleep_s,
         exception,
@@ -205,11 +210,21 @@ def _string_map(values: dict[str, Any]) -> dict[str, str]:
     return {str(key): str(value) for key, value in values.items()}
 
 
+def _metadata_value(value: Any) -> str:
+    normalized = METADATA_VALUE_RE.sub("_", str(value)).strip("._-")
+    normalized = normalized[:63].strip("._-")
+    return normalized or "metadata"
+
+
+def _metadata_map(values: dict[str, Any]) -> dict[str, str]:
+    return {str(key): _metadata_value(value) for key, value in values.items()}
+
+
 def _normalize_spec(spec: SandboxSpec) -> SandboxSpec:
     return replace(
         spec,
         env=_string_map(spec.env),
-        metadata=_string_map(spec.metadata),
+        metadata=_metadata_map(spec.metadata),
         resources=_string_map(spec.resources),
         extensions=_string_map(spec.extensions),
     )
@@ -226,13 +241,7 @@ def _to_volumes(volumes: list[dict[str, Any]]) -> list[Any]:
 
 
 class OpenSandboxProvider:
-    """Provider backed by OpenSandbox.
-
-    ``batch_mode="sdk"`` uses ``opensandbox.Sandbox.create`` for each sandbox.
-    ``batch_mode="batchsandbox"`` creates one Kubernetes ``BatchSandbox`` CR per
-    batch and exposes each ready endpoint through the same provider-neutral
-    ``SandboxHandle`` interface.
-    """
+    """Provider backed by the OpenSandbox SDK/server API."""
 
     name = "opensandbox"
 
@@ -250,7 +259,8 @@ class OpenSandboxProvider:
         create_probe_expected_stdout: str | None = "nemo-rl-sandbox-ready",
         create_probe_timeout_s: int = 30,
         create_probe_sample_count: int | None = None,
-        batch_mode: str = "sdk",
+        create_probe_stable_count: int = 1,
+        create_probe_stable_delay_s: float = 0.0,
         batch_create_concurrency: int = 4,
         batch_create_progress_timeout_s: float | None = None,
         batch_create_retries: int = 2,
@@ -260,18 +270,12 @@ class OpenSandboxProvider:
         operation_retry_delay_s: float = 1.0,
         operation_retry_max_delay_s: float = 15.0,
         sdk_max_connections: int | None = 512,
-        sdk_max_keepalive_connections: int | None = 128,
+        sdk_max_keepalive_connections: int | None = 0,
         sdk_keepalive_expiry_s: float = 30.0,
-        batchsandbox_namespace: str = DEFAULT_BATCHSANDBOX_NAMESPACE,
-        batchsandbox_ready_timeout_s: float | None = None,
-        batchsandbox_progress_timeout_s: float | None = None,
-        batchsandbox_endpoint_only_ready_after_s: float | None = None,
-        batchsandbox_poll_interval_s: float = 2.0,
-        batchsandbox_execd_port: int = DEFAULT_EXECD_PORT,
-        batchsandbox_execd_image: str = DEFAULT_EXECD_IMAGE,
+        image_pull_policy: str | None = DEFAULT_IMAGE_PULL_POLICY,
     ) -> None:
-        if batch_mode not in {"sdk", "batchsandbox"}:
-            raise ValueError("batch_mode must be either 'sdk' or 'batchsandbox'")
+        if image_pull_policy is not None:
+            image_pull_policy = validate_image_pull_policy(image_pull_policy)
         self._domain = domain
         self._api_key = api_key
         self._protocol = protocol
@@ -283,13 +287,11 @@ class OpenSandboxProvider:
         self._create_probe_expected_stdout = create_probe_expected_stdout
         self._create_probe_timeout_s = create_probe_timeout_s
         self._create_probe_sample_count = create_probe_sample_count
-        self._batch_mode = batch_mode
+        self._create_probe_stable_count = create_probe_stable_count
+        self._create_probe_stable_delay_s = create_probe_stable_delay_s
         if batch_create_concurrency < 1:
             raise ValueError("batch_create_concurrency must be >= 1")
-        if (
-            batch_create_progress_timeout_s is not None
-            and batch_create_progress_timeout_s <= 0
-        ):
+        if batch_create_progress_timeout_s is not None and batch_create_progress_timeout_s <= 0:
             raise ValueError("batch_create_progress_timeout_s must be > 0")
         if create_timeout_s is not None and create_timeout_s <= 0:
             raise ValueError("create_timeout_s must be > 0")
@@ -297,6 +299,10 @@ class OpenSandboxProvider:
             raise ValueError("create_probe_timeout_s must be > 0")
         if create_probe_sample_count is not None and create_probe_sample_count < 1:
             raise ValueError("create_probe_sample_count must be >= 1")
+        if create_probe_stable_count < 1:
+            raise ValueError("create_probe_stable_count must be >= 1")
+        if create_probe_stable_delay_s < 0:
+            raise ValueError("create_probe_stable_delay_s must be >= 0")
         if batch_create_retries < 0:
             raise ValueError("batch_create_retries must be >= 0")
         if batch_create_retry_delay_s < 0:
@@ -311,36 +317,10 @@ class OpenSandboxProvider:
             raise ValueError("operation_retry_max_delay_s must be >= 0")
         if sdk_max_connections is not None and sdk_max_connections < 1:
             raise ValueError("sdk_max_connections must be >= 1")
-        if (
-            sdk_max_keepalive_connections is not None
-            and sdk_max_keepalive_connections < 0
-        ):
+        if sdk_max_keepalive_connections is not None and sdk_max_keepalive_connections < 0:
             raise ValueError("sdk_max_keepalive_connections must be >= 0")
         if sdk_keepalive_expiry_s <= 0:
             raise ValueError("sdk_keepalive_expiry_s must be > 0")
-        if not batchsandbox_namespace:
-            raise ValueError("batchsandbox_namespace must be non-empty")
-        if (
-            batchsandbox_ready_timeout_s is not None
-            and batchsandbox_ready_timeout_s <= 0
-        ):
-            raise ValueError("batchsandbox_ready_timeout_s must be > 0")
-        if (
-            batchsandbox_progress_timeout_s is not None
-            and batchsandbox_progress_timeout_s <= 0
-        ):
-            raise ValueError("batchsandbox_progress_timeout_s must be > 0")
-        if (
-            batchsandbox_endpoint_only_ready_after_s is not None
-            and batchsandbox_endpoint_only_ready_after_s <= 0
-        ):
-            raise ValueError("batchsandbox_endpoint_only_ready_after_s must be > 0")
-        if batchsandbox_poll_interval_s <= 0:
-            raise ValueError("batchsandbox_poll_interval_s must be > 0")
-        if batchsandbox_execd_port <= 0:
-            raise ValueError("batchsandbox_execd_port must be > 0")
-        if not batchsandbox_execd_image:
-            raise ValueError("batchsandbox_execd_image must be non-empty")
         self._batch_create_concurrency = batch_create_concurrency
         self._batch_create_progress_timeout_s = batch_create_progress_timeout_s
         self._batch_create_retries = batch_create_retries
@@ -354,21 +334,23 @@ class OpenSandboxProvider:
         self._sdk_keepalive_expiry_s = sdk_keepalive_expiry_s
         self._sdk_transport: Any | None = None
         self._sdk_transport_loop: asyncio.AbstractEventLoop | None = None
-        self._batchsandbox_namespace = batchsandbox_namespace
-        self._batchsandbox_ready_timeout_s = batchsandbox_ready_timeout_s
-        self._batchsandbox_progress_timeout_s = batchsandbox_progress_timeout_s
-        self._batchsandbox_endpoint_only_ready_after_s = (
-            batchsandbox_endpoint_only_ready_after_s
+        self._image_pull_policy = image_pull_policy
+
+    def _with_default_image_pull_policy(self, spec: SandboxSpec) -> SandboxSpec:
+        """Ensure SDK create requests carry the desired image pull policy."""
+        if self._image_pull_policy is None:
+            return spec
+
+        extensions = dict(spec.extensions)
+        image_pull_policy = extensions.get(IMAGE_PULL_POLICY_EXTENSION_KEY) or extensions.get(
+            IMAGE_PULL_POLICY_ANNOTATION_EXTENSION_KEY
         )
-        self._batchsandbox_execd_port = batchsandbox_execd_port
-        self._batchsandbox_execd_image = batchsandbox_execd_image
-        self._batchsandbox_client = BatchSandboxClient(
-            namespace=batchsandbox_namespace,
-            retries=batch_create_retries,
-            retry_delay_s=batch_create_retry_delay_s,
-            retry_max_delay_s=batch_create_retry_max_delay_s,
-            poll_interval_s=batchsandbox_poll_interval_s,
-        )
+        if image_pull_policy is None:
+            image_pull_policy = self._image_pull_policy
+        image_pull_policy = validate_image_pull_policy(image_pull_policy)
+        extensions.setdefault(IMAGE_PULL_POLICY_EXTENSION_KEY, image_pull_policy)
+        extensions.setdefault(IMAGE_PULL_POLICY_ANNOTATION_EXTENSION_KEY, image_pull_policy)
+        return replace(spec, extensions=extensions)
 
     def _sdk_shared_transport(self) -> Any | None:
         if self._sdk_max_connections is None:
@@ -440,8 +422,7 @@ class OpenSandboxProvider:
             return await asyncio.wait_for(awaitable, timeout=timeout_s)
         except asyncio.TimeoutError as e:
             raise TimeoutError(
-                f"Timed out during OpenSandbox {operation} after {timeout_s:g}s; "
-                f"sandbox_id={sandbox_id!r}"
+                f"Timed out during OpenSandbox {operation} after {timeout_s:g}s; sandbox_id={sandbox_id!r}"
             ) from e
 
     async def _await_sdk_operation(
@@ -477,42 +458,50 @@ class OpenSandboxProvider:
         if self._create_probe_command is None:
             return
 
-        try:
-            async with observability_span(
-                "sandbox.create_probe",
-                phase="startup",
-                attributes={
-                    "provider": self.name,
-                    "sandbox_id": handle.sandbox_id,
-                },
-            ):
-                result = await asyncio.wait_for(
-                    self.exec(
-                        handle,
-                        self._create_probe_command,
-                        timeout_s=self._create_probe_timeout_s,
-                        user="root",
-                    ),
-                    timeout=self._create_probe_timeout_s,
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            raise OpenSandboxCreateVerificationError(
-                "OpenSandbox sandbox failed create probe command; "
-                f"sandbox_id={handle.sandbox_id!r}, "
-                f"command={self._create_probe_command!r}"
-            ) from e
+        for probe_index in range(self._create_probe_stable_count):
+            try:
+                async with observability_span(
+                    "sandbox.create_probe",
+                    phase="startup",
+                    attributes={
+                        "provider": self.name,
+                        "sandbox_id": handle.sandbox_id,
+                        "probe_index": probe_index,
+                        "probe_count": self._create_probe_stable_count,
+                    },
+                ):
+                    result = await asyncio.wait_for(
+                        self.exec(
+                            handle,
+                            self._create_probe_command,
+                            timeout_s=self._create_probe_timeout_s,
+                            user="root",
+                        ),
+                        timeout=self._create_probe_timeout_s,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                raise OpenSandboxCreateVerificationError(
+                    "OpenSandbox sandbox failed create probe command; "
+                    f"sandbox_id={handle.sandbox_id!r}, "
+                    f"command={self._create_probe_command!r}, "
+                    f"probe={probe_index + 1}/{self._create_probe_stable_count}"
+                ) from e
 
-        stdout = result.stdout or ""
-        expected = self._create_probe_expected_stdout
-        if result.return_code != 0 or (expected is not None and expected not in stdout):
-            raise OpenSandboxCreateVerificationError(
-                "OpenSandbox sandbox create probe command returned an "
-                f"unexpected result; sandbox_id={handle.sandbox_id!r}, "
-                f"return_code={result.return_code}, expected_stdout={expected!r}, "
-                f"stdout={stdout[:200]!r}, stderr={(result.stderr or '')[:200]!r}"
-            )
+            stdout = result.stdout or ""
+            expected = self._create_probe_expected_stdout
+            if result.return_code != 0 or (expected is not None and expected not in stdout):
+                raise OpenSandboxCreateVerificationError(
+                    "OpenSandbox sandbox create probe command returned an "
+                    f"unexpected result; sandbox_id={handle.sandbox_id!r}, "
+                    f"return_code={result.return_code}, expected_stdout={expected!r}, "
+                    f"stdout={stdout[:200]!r}, stderr={(result.stderr or '')[:200]!r}, "
+                    f"probe={probe_index + 1}/{self._create_probe_stable_count}"
+                )
+
+            if probe_index + 1 < self._create_probe_stable_count and self._create_probe_stable_delay_s:
+                await asyncio.sleep(self._create_probe_stable_delay_s)
 
     async def _verify_created_handles(
         self,
@@ -523,17 +512,13 @@ class OpenSandboxProvider:
             return
 
         handles_to_probe = handles
-        if (
-            self._create_probe_sample_count is not None
-            and self._create_probe_sample_count < len(handles)
-        ):
+        if self._create_probe_sample_count is not None and self._create_probe_sample_count < len(handles):
             sample_count = self._create_probe_sample_count
             if sample_count == 1:
                 sampled_indices = [0]
             else:
                 sampled_indices = [
-                    round(index * (len(handles) - 1) / (sample_count - 1))
-                    for index in range(sample_count)
+                    round(index * (len(handles) - 1) / (sample_count - 1)) for index in range(sample_count)
                 ]
             handles_to_probe = [handles[index] for index in sampled_indices]
 
@@ -559,8 +544,7 @@ class OpenSandboxProvider:
             await self.close(handle, delete=True)
         except Exception as e:
             LOGGER.warning(
-                "Failed to clean up OpenSandbox sandbox after create probe "
-                "failure; sandbox_id=%s; error=%r",
+                "Failed to clean up OpenSandbox sandbox after create probe failure; sandbox_id=%s; error=%r",
                 handle.sandbox_id,
                 e,
             )
@@ -569,7 +553,7 @@ class OpenSandboxProvider:
         """Create a sandbox through ``opensandbox.Sandbox.create``."""
         if spec.extensions.get("poolRef") and self._use_server_proxy is False:
             raise ValueError(
-                "OpenSandbox pooled BatchSandbox creation requires "
+                "OpenSandbox pooled creation requires "
                 "use_server_proxy=True so SDK calls are routed through the "
                 "server proxy and do not rely on stale cached pod endpoints."
             )
@@ -581,9 +565,7 @@ class OpenSandboxProvider:
             "metadata": spec.metadata,
             "resource": spec.resources,
             "extensions": spec.extensions,
-            "connection_config": self._connection_config(
-                request_timeout_s=self._create_request_timeout_s
-            ),
+            "connection_config": self._connection_config(request_timeout_s=self._create_request_timeout_s),
         }
         if spec.image is not None:
             kwargs["image"] = spec.image
@@ -612,7 +594,6 @@ class OpenSandboxProvider:
                 phase="startup",
                 attributes={
                     "provider": self.name,
-                    "batch_mode": self._batch_mode,
                     "image": spec.image,
                     "pool_ref": spec.extensions.get("poolRef"),
                 },
@@ -631,9 +612,7 @@ class OpenSandboxProvider:
                 f"poolRef={spec.extensions.get('poolRef')!r}, "
                 f"ready_timeout_s={spec.ready_timeout_s!r}"
             ) from e
-        handle = SandboxHandle(
-            sandbox_id=str(sandbox.id), provider_name=self.name, raw=sandbox
-        )
+        handle = SandboxHandle(sandbox_id=str(sandbox.id), provider_name=self.name, raw=sandbox)
         try:
             await self._verify_created_handle(handle)
         except OpenSandboxCreateVerificationError:
@@ -667,20 +646,18 @@ class OpenSandboxProvider:
         raise OpenSandboxBatchCreateError("OpenSandbox create retry loop did not run")
 
     async def create(self, spec: SandboxSpec) -> SandboxHandle:
-        """Create one sandbox through the configured OpenSandbox batch mode."""
-        spec = _normalize_spec(spec)
+        """Create one sandbox through the OpenSandbox SDK."""
+        spec = self._with_default_image_pull_policy(_normalize_spec(spec))
         async with observability_span(
             "sandbox.create",
             phase="startup",
             attributes={
                 "provider": self.name,
-                "batch_mode": self._batch_mode,
                 "image": spec.image,
+                "image_pull_policy": spec.extensions.get(IMAGE_PULL_POLICY_EXTENSION_KEY),
                 "pool_ref": spec.extensions.get("poolRef"),
             },
         ):
-            if self._batch_mode == "batchsandbox":
-                return (await self.create_batch(spec, 1))[0]
             return await self._create_with_retries(spec)
 
     async def _close_many(
@@ -709,14 +686,7 @@ class OpenSandboxProvider:
         *,
         allow_partial: bool = False,
     ) -> list[SandboxHandle]:
-        """Create several sandboxes through the OpenSandbox SDK.
-
-        When the OpenSandbox server is configured with the BatchSandbox workload
-        provider and ``spec.extensions`` contains ``poolRef``, each SDK create
-        request is backed by a BatchSandbox allocation without NeMo-RL touching
-        raw Kubernetes manifests. By default a batch is all-or-nothing. Callers
-        that can make progress with fewer sandboxes may set ``allow_partial``.
-        """
+        """Create several sandboxes through the OpenSandbox SDK."""
         if count < 1:
             raise ValueError("count must be >= 1")
         semaphore = asyncio.Semaphore(self._batch_create_concurrency)
@@ -774,9 +744,7 @@ class OpenSandboxProvider:
                 wait_timeout_s = 1.0
                 if self._batch_create_progress_timeout_s is not None:
                     idle_s = loop.time() - last_progress_at
-                    remaining_progress_s = (
-                        self._batch_create_progress_timeout_s - idle_s
-                    )
+                    remaining_progress_s = self._batch_create_progress_timeout_s - idle_s
                     if remaining_progress_s <= 0:
                         progress_timeout_error = OpenSandboxCreateTimeoutError(
                             "Timed out waiting for OpenSandbox SDK batch create "
@@ -789,9 +757,7 @@ class OpenSandboxProvider:
                         break
                     wait_timeout_s = min(wait_timeout_s, remaining_progress_s)
                 try:
-                    await asyncio.wait_for(
-                        asyncio.shield(queue_join), timeout=wait_timeout_s
-                    )
+                    await asyncio.wait_for(asyncio.shield(queue_join), timeout=wait_timeout_s)
                 except asyncio.TimeoutError:
                     if self._batch_create_progress_timeout_s is None:
                         continue
@@ -816,15 +782,10 @@ class OpenSandboxProvider:
             await asyncio.gather(*workers, return_exceptions=True)
         if progress_timeout_error is not None:
             cleanup_results = await self._close_many(created_handles, delete=True)
-            cleanup_errors = [
-                repr(result)
-                for result in cleanup_results
-                if isinstance(result, BaseException)
-            ]
+            cleanup_errors = [repr(result) for result in cleanup_results if isinstance(result, BaseException)]
             if cleanup_errors:
                 progress_timeout_error.args = (
-                    f"{progress_timeout_error.args[0]}, "
-                    f"cleanup_errors={cleanup_errors[:3]}",
+                    f"{progress_timeout_error.args[0]}, cleanup_errors={cleanup_errors[:3]}",
                 )
             raise progress_timeout_error
         complete_handles = [handle for handle in handles if handle is not None]
@@ -855,11 +816,7 @@ class OpenSandboxProvider:
                 return prefix_handles
 
             cleanup_results = await self._close_many(created_handles, delete=True)
-            cleanup_errors = [
-                repr(result)
-                for result in cleanup_results
-                if isinstance(result, BaseException)
-            ]
+            cleanup_errors = [repr(result) for result in cleanup_results if isinstance(result, BaseException)]
             error = create_errors[0]
             message = (
                 "Failed to preallocate OpenSandbox sandboxes after retries: "
@@ -892,68 +849,6 @@ class OpenSandboxProvider:
 
         return complete_handles
 
-    async def _create_batch_batchsandbox(
-        self,
-        spec: SandboxSpec,
-        count: int,
-        *,
-        allow_partial: bool = False,
-    ) -> list[SandboxHandle]:
-        name = batchsandbox_name(spec)
-        manifest = build_batchsandbox_manifest(
-            spec,
-            name=name,
-            namespace=self._batchsandbox_namespace,
-            count=count,
-            execd_image=self._batchsandbox_execd_image,
-            provider_name=self.name,
-        )
-        timeout_s = (
-            self._batchsandbox_ready_timeout_s
-            or spec.ready_timeout_s
-            or self._create_timeout_s
-            or self._request_timeout_s
-            or 300.0
-        )
-        try:
-            await self._batchsandbox_client.create(manifest)
-            _, endpoints = await self._batchsandbox_client.wait_ready(
-                name,
-                count=count,
-                timeout_s=float(timeout_s),
-                progress_timeout_s=self._batchsandbox_progress_timeout_s,
-                endpoint_only_ready_after_s=(
-                    self._batchsandbox_endpoint_only_ready_after_s
-                ),
-                allow_partial=allow_partial,
-            )
-            connection_config = self._connection_config()
-            handles = []
-            for index, endpoint in enumerate(endpoints):
-                raw = BatchSandboxReplica(
-                    batch_name=name,
-                    replica_index=index,
-                    endpoint=endpoint_with_port(
-                        endpoint, self._batchsandbox_execd_port
-                    ),
-                    connection_config=connection_config,
-                    delete_batch=self.delete_batch,
-                )
-                handle = SandboxHandle(
-                    sandbox_id=raw.id,
-                    provider_name=self.name,
-                    raw=raw,
-                )
-                handles.append(handle)
-            await self._verify_created_handles(handles)
-            return handles
-        except TimeoutError as e:
-            await self.delete_batch(name)
-            raise OpenSandboxCreateTimeoutError(str(e)) from e
-        except Exception:
-            await self.delete_batch(name)
-            raise
-
     async def create_batch(
         self,
         spec: SandboxSpec,
@@ -964,25 +859,19 @@ class OpenSandboxProvider:
         """Create several equivalent OpenSandbox sandboxes."""
         if count < 1:
             raise ValueError("count must be >= 1")
-        spec = _normalize_spec(spec)
+        spec = self._with_default_image_pull_policy(_normalize_spec(spec))
         async with observability_span(
             "sandbox.create_batch",
             phase="startup",
             attributes={
                 "provider": self.name,
-                "batch_mode": self._batch_mode,
                 "count": count,
                 "allow_partial": allow_partial,
                 "image": spec.image,
+                "image_pull_policy": spec.extensions.get(IMAGE_PULL_POLICY_EXTENSION_KEY),
                 "pool_ref": spec.extensions.get("poolRef"),
             },
         ):
-            if self._batch_mode == "batchsandbox":
-                return await self._create_batch_batchsandbox(
-                    spec,
-                    count,
-                    allow_partial=allow_partial,
-                )
             return await self._create_batch_sdk(
                 spec,
                 count,
@@ -998,15 +887,6 @@ class OpenSandboxProvider:
         serializable reference across that boundary and re-materialize SDK
         adapters in the consuming event loop.
         """
-        if hasattr(handle.raw, "batch_name"):
-            return {
-                "kind": "batchsandbox_replica",
-                "provider": self.name,
-                "sandbox_id": handle.sandbox_id,
-                "batch_name": handle.raw.batch_name,
-                "replica_index": handle.raw.replica_index,
-                "endpoint": handle.raw.endpoint,
-            }
         return {
             "kind": "sandbox_id",
             "provider": self.name,
@@ -1016,44 +896,15 @@ class OpenSandboxProvider:
     async def materialize_handle(self, reference: dict[str, Any]) -> SandboxHandle:
         """Create a loop-local handle from ``handle_reference`` output."""
         kind = reference.get("kind")
-        if kind == "batchsandbox_replica":
-            raw = BatchSandboxReplica(
-                batch_name=str(reference["batch_name"]),
-                replica_index=int(reference["replica_index"]),
-                endpoint=str(reference["endpoint"]),
-                connection_config=self._connection_config(),
-                delete_batch=self.delete_batch,
-            )
-            return SandboxHandle(
-                sandbox_id=str(reference.get("sandbox_id") or raw.id),
-                provider_name=self.name,
-                raw=raw,
-            )
         if kind == "sandbox_id":
             return await self.connect(str(reference["sandbox_id"]))
         raise ValueError(f"Unsupported OpenSandbox handle reference kind: {kind!r}")
 
-    async def delete_batch(self, batch_name: str) -> None:
-        """Delete one provider-created BatchSandbox CR by name."""
-        async with observability_span(
-            "sandbox.delete_batch",
-            phase="cleanup",
-            attributes={
-                "provider": self.name,
-                "batch_name": batch_name,
-            },
-        ):
-            await self._batchsandbox_client.delete(batch_name)
-
     async def connect(self, sandbox_id: str) -> SandboxHandle:
         """Connect to an existing OpenSandbox sandbox."""
         Sandbox, _, _, _, _ = _require_opensandbox_sdk()
-        sandbox = await Sandbox.connect(
-            sandbox_id, connection_config=self._connection_config()
-        )
-        return SandboxHandle(
-            sandbox_id=str(sandbox.id), provider_name=self.name, raw=sandbox
-        )
+        sandbox = await Sandbox.connect(sandbox_id, connection_config=self._connection_config())
+        return SandboxHandle(sandbox_id=str(sandbox.id), provider_name=self.name, raw=sandbox)
 
     async def exec(
         self,
@@ -1080,23 +931,15 @@ class OpenSandboxProvider:
         if isinstance(user, int):
             opts_kwargs["uid"] = user
         elif isinstance(user, str) and user != "root":
-            effective_command = (
-                f"su -s /bin/sh -c {shlex.quote(command)} {shlex.quote(user)}"
-            )
+            effective_command = f"su -s /bin/sh -c {shlex.quote(command)} {shlex.quote(user)}"
 
         sdk_timeout_s = (
             float(timeout_s) + 60.0
             if timeout_s is not None
-            else (
-                float(self._request_timeout_s)
-                if self._request_timeout_s is not None
-                else None
-            )
+            else (float(self._request_timeout_s) if self._request_timeout_s is not None else None)
         )
         recorder = current_recorder()
-        include_command_text = (
-            recorder.include_command_text if recorder is not None else False
-        )
+        include_command_text = recorder.include_command_text if recorder is not None else False
         async with observability_span(
             "sandbox.exec",
             phase="execution",
@@ -1110,9 +953,7 @@ class OpenSandboxProvider:
             },
         ):
             execution = await self._await_sdk_operation(
-                lambda: handle.raw.commands.run(
-                    effective_command, opts=RunCommandOpts(**opts_kwargs)
-                ),
+                lambda: handle.raw.commands.run(effective_command, opts=RunCommandOpts(**opts_kwargs)),
                 operation="command run",
                 sandbox_id=handle.sandbox_id,
                 timeout_s=sdk_timeout_s,
@@ -1129,13 +970,9 @@ class OpenSandboxProvider:
         else:
             return_code = 0
 
-        return SandboxExecResult(
-            stdout=stdout, stderr=stderr, return_code=return_code
-        )
+        return SandboxExecResult(stdout=stdout, stderr=stderr, return_code=return_code)
 
-    async def write_file(
-        self, handle: SandboxHandle, target_path: str, data: str | bytes
-    ) -> None:
+    async def write_file(self, handle: SandboxHandle, target_path: str, data: str | bytes) -> None:
         """Write one file into an OpenSandbox sandbox."""
         async with observability_span(
             "sandbox.write_file",
@@ -1151,9 +988,7 @@ class OpenSandboxProvider:
                 lambda: handle.raw.files.write_file(target_path, data),
                 operation=f"write_file({target_path})",
                 sandbox_id=handle.sandbox_id,
-                timeout_s=float(self._request_timeout_s)
-                if self._request_timeout_s is not None
-                else None,
+                timeout_s=float(self._request_timeout_s) if self._request_timeout_s is not None else None,
             )
 
     async def read_file(self, handle: SandboxHandle, source_path: str) -> bytes:
@@ -1171,20 +1006,14 @@ class OpenSandboxProvider:
                 lambda: handle.raw.files.read_bytes(source_path),
                 operation=f"read_file({source_path})",
                 sandbox_id=handle.sandbox_id,
-                timeout_s=float(self._request_timeout_s)
-                if self._request_timeout_s is not None
-                else None,
+                timeout_s=float(self._request_timeout_s) if self._request_timeout_s is not None else None,
             )
 
-    async def upload_file(
-        self, handle: SandboxHandle, source_path: Path, target_path: str
-    ) -> None:
+    async def upload_file(self, handle: SandboxHandle, source_path: Path, target_path: str) -> None:
         """Upload one local file into an OpenSandbox sandbox."""
         await self.write_file(handle, target_path, source_path.read_bytes())
 
-    async def download_file(
-        self, handle: SandboxHandle, source_path: str, target_path: Path
-    ) -> None:
+    async def download_file(self, handle: SandboxHandle, source_path: str, target_path: Path) -> None:
         """Download one file from an OpenSandbox sandbox."""
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_bytes(await self.read_file(handle, source_path))
@@ -1198,15 +1027,8 @@ class OpenSandboxProvider:
                 "provider": self.name,
                 "sandbox_id": handle.sandbox_id,
                 "delete": delete,
-                "batch_name": getattr(handle.raw, "batch_name", None),
             },
         ):
-            if hasattr(handle.raw, "batch_name"):
-                if delete:
-                    await self.delete_batch(handle.raw.batch_name)
-                await handle.raw.close()
-                return
-
             kill_error: Exception | None = None
             if delete:
                 retry_policy = AsyncRetrying(

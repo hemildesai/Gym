@@ -17,8 +17,8 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter, defaultdict
 import json
+from collections import Counter
 from pathlib import Path
 from statistics import mean
 from typing import Any, Iterable
@@ -231,10 +231,6 @@ def summarize(observability_dir: Path, *, rollouts: Path | None = None) -> dict[
     }
 
     durations = {
-        "batchsandbox_create_cr_s": _duration_stats(
-            events,
-            name="batchsandbox.create_cr",
-        ),
         "sandbox_create_api_s": _duration_stats(events, name="sandbox.create_api"),
         "sandbox_create_probe_s": _duration_stats(events, name="sandbox.create_probe"),
         "sandbox_start_s": _duration_stats(events, name="sandbox.start"),
@@ -297,7 +293,6 @@ def summarize(observability_dir: Path, *, rollouts: Path | None = None) -> dict[
         "durations": durations,
         "startup_breakdown_s": {
             "sandbox_readiness": durations["sandbox_start_s"],
-            "batchsandbox_create_cr": durations["batchsandbox_create_cr_s"],
             "opensandbox_create_api": durations["sandbox_create_api_s"],
             "first_exec_probe": durations["sandbox_create_probe_s"],
             "environment_setup": durations["sandbox_setup_s"],
@@ -322,7 +317,6 @@ def summarize(observability_dir: Path, *, rollouts: Path | None = None) -> dict[
             "upload_environment": durations["sandbox_upload_environment_s"],
             "description": {
                 "sandbox_readiness": "OpenSandbox allocation through first successful sandbox start probe.",
-                "batchsandbox_create_cr": "Provider-owned Kubernetes BatchSandbox CR creation before the explicit exec probe.",
                 "environment_setup": "Harbor/Gym environment bootstrap after the sandbox is reachable.",
                 "borrow_setup": "Rollout-path Harbor environment reset/upload/setup after borrowing a prewarmed handle.",
                 "prewarm_setup": "Pre-rollout Harbor environment reset/upload/setup performed against idle pool handles.",

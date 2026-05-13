@@ -19,6 +19,7 @@ harbor_agent:
         suppress_max_turns_warning: true
         interleaved_thinking: true
         enable_summarize: false
+        record_terminal_session: true
         collect_rollout_details: true
         trajectory_config:
           raw_content: true
@@ -29,7 +30,7 @@ harbor_agent:
           output_cost_per_token: 0.0
 
       harbor_environment_type: null
-      harbor_environment_import_path: nemo_gym.sandbox.integrations.harbor:OpenSandboxHarborSandbox
+      harbor_environment_import_path: responses_api_agents.harbor_agent.sandbox:SandboxHarborEnvironment
       harbor_environment_kwargs:
         provider:
           name: opensandbox
@@ -38,7 +39,6 @@ harbor_agent:
             api_key: ${oc.env:OPENSANDBOX_API_KEY}
             protocol: http
             use_server_proxy: true
-            batch_mode: sdk
             batch_create_concurrency: 128
             batch_create_progress_timeout_s: 300
             batch_create_retries: 10
@@ -49,7 +49,7 @@ harbor_agent:
             create_timeout_s: 1200
             create_probe_timeout_s: 60
             sdk_max_connections: 512
-            sdk_max_keepalive_connections: 128
+            sdk_max_keepalive_connections: 0
         spec:
           timeout_s: 18000
           ready_timeout_s: 1200

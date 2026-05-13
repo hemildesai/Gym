@@ -16,8 +16,8 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -90,9 +90,7 @@ def _build_spans(
     spans = []
     instant_events = []
 
-    for index, event in enumerate(
-        sorted(events, key=lambda row: float(row.get("timestamp_unix_s") or 0.0))
-    ):
+    for index, event in enumerate(sorted(events, key=lambda row: float(row.get("timestamp_unix_s") or 0.0))):
         event_type = str(event.get("event_type") or "event")
         name = str(event.get("name") or "unknown")
         attrs = dict(event.get("attributes") or {})
@@ -358,11 +356,7 @@ def _pop_matching_start(
         if not stack:
             continue
         candidate_name, candidate_trajectory_id, candidate_sandbox_id, _phase = candidate
-        if (
-            candidate_name == name
-            and candidate_trajectory_id == trajectory_id
-            and candidate_sandbox_id == sandbox_id
-        ):
+        if candidate_name == name and candidate_trajectory_id == trajectory_id and candidate_sandbox_id == sandbox_id:
             return stack.pop()
     return None
 
@@ -437,9 +431,7 @@ def _standardized_attributes(
         upstream_api = str(standardized.get("upstream_api") or "chat")
         standardized.setdefault("gen_ai.operation.name", upstream_api)
         model_name = (
-            standardized.get("model")
-            or standardized.get("model_name")
-            or standardized.get("upstream_model_name")
+            standardized.get("model") or standardized.get("model_name") or standardized.get("upstream_model_name")
         )
         if model_name is not None:
             standardized.setdefault("gen_ai.request.model", str(model_name))
@@ -517,11 +509,7 @@ def _otlp_span(span: dict[str, Any]) -> dict[str, Any]:
         "kind": span.get("kind") or "SPAN_KIND_INTERNAL",
         "startTimeUnixNano": span["start_time_unix_nano"],
         "endTimeUnixNano": span["end_time_unix_nano"],
-        "attributes": [
-            _attribute(key, value)
-            for key, value in sorted(attrs.items())
-            if value is not None
-        ],
+        "attributes": [_attribute(key, value) for key, value in sorted(attrs.items()) if value is not None],
         "status": {"code": status_code},
     }
     if span.get("parent_span_id"):
@@ -637,11 +625,7 @@ def _chrome_trace_payload(
 
 
 def _semantic_trace_spans(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    scopes_with_tools = {
-        _chrome_scope(span["attributes"])
-        for span in spans
-        if span["name"] in _SEMANTIC_TOOL_NAMES
-    }
+    scopes_with_tools = {_chrome_scope(span["attributes"]) for span in spans if span["name"] in _SEMANTIC_TOOL_NAMES}
     has_trajectory_tools = bool(scopes_with_tools)
     semantic_spans = []
     for span in spans:
@@ -694,9 +678,4 @@ def _semantic_display_name(span: dict[str, Any]) -> str:
 
 
 def _chrome_scope(attrs: dict[str, Any]) -> str:
-    return str(
-        attrs.get("trajectory_id")
-        or attrs.get("trial_name")
-        or attrs.get("sandbox_id")
-        or "run"
-    )
+    return str(attrs.get("trajectory_id") or attrs.get("trial_name") or attrs.get("sandbox_id") or "run")

@@ -52,7 +52,7 @@ from responses_api_agents.mini_swe_agent.utils import MiniSWEAgentUtils
 
 class MiniSWEAgentConfig(BaseResponsesAPIAgentConfig):
     model_server: ModelServerRef
-    env: Literal["docker", "singularity", "opensandbox"]
+    env: Literal["docker", "singularity", "sandbox"]
     concurrency: int
     cache_dir_template: Optional[str] = None
     sandbox_provider: Optional[dict[str, Any]] = None
@@ -89,15 +89,17 @@ def runner_ray_remote(runner: Callable, params: dict[str, Any]) -> Any:
     return runner(**params)
 
 
-def run_swegym_with_optional_opensandbox(**params: Any) -> Any:
-    if params.get("env") == "opensandbox":
+def _uses_sandbox_env(env: str) -> bool:
+    return env == "sandbox"
+
+
+def run_swegym_with_optional_sandbox(**params: Any) -> Any:
+    if _uses_sandbox_env(params.get("env", "")):
         from minisweagent.environments import ENV_MAP
 
-        from responses_api_agents.mini_swe_agent.opensandbox_env import (
-            OpenSandboxMiniSWEEnvironment,
-        )
+        from responses_api_agents.mini_swe_agent.sandbox_environment import MiniSWESandboxEnvironment
 
-        ENV_MAP["opensandbox"] = OpenSandboxMiniSWEEnvironment
+        ENV_MAP["sandbox"] = MiniSWESandboxEnvironment
     return run_swegym(**params)
 
 
@@ -156,15 +158,15 @@ class MiniSWEAgent(SimpleResponsesAPIAgent):
 
             output_file_dir = f"{Path.cwd()}/results/{subset}/{policy_model_name}"
             config_path = mini_swe_config_path
-            if env == "opensandbox":
+            if _uses_sandbox_env(env):
                 if self.config.sandbox_provider is None:
-                    raise ValueError("env=opensandbox requires sandbox_provider")
+                    raise ValueError("env=sandbox requires sandbox_provider")
                 config.setdefault("environment", {}).update(self.config.sandbox_environment_kwargs or {})
                 config["environment"]["provider"] = self.config.sandbox_provider
                 config["environment"]["spec"] = self.config.sandbox_spec or {}
                 config_output_dir = Path(output_file_dir) / "_configs"
                 config_output_dir.mkdir(parents=True, exist_ok=True)
-                config_path = config_output_dir / f"{instance_id}.opensandbox.yaml"
+                config_path = config_output_dir / f"{instance_id}.sandbox.yaml"
                 config_path.write_text(yaml.safe_dump(config, sort_keys=False))
 
             if self.config.skip_if_exists:
@@ -218,7 +220,7 @@ class MiniSWEAgent(SimpleResponsesAPIAgent):
                     collapse_limit=collapse_limit,
                 )
                 future = runner_ray_remote.options(num_cpus=self.config.runner_num_cpus).remote(
-                    run_swegym_with_optional_opensandbox,
+                    run_swegym_with_optional_sandbox,
                     params,
                 )
                 result = await asyncio.to_thread(ray.get, future)

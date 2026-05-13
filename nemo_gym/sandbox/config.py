@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Typed configuration for sandbox trajectory collection.
+"""Typed configuration for sandbox providers and observability.
 
 Defaults for these fields belong in YAML exemplars. Code should require keys
 from enabled configs instead of silently supplying behavior here.
@@ -32,39 +32,6 @@ class SandboxProviderConfig(TypedDict):
 
     name: str
     kwargs: NotRequired[dict[str, Any]]
-
-
-class SandboxIntegrationConfig(TypedDict):
-    """Trajectory-producing integration layered on top of the provider.
-
-    Keys:
-        name: Integration name, for example ``harbor`` or ``precomputed``.
-        kwargs: Integration-specific settings. Harbor requires ``trial_config``,
-            ``environment_spec``, and ``max_retries``; Harbor-native agents also
-            require ``collect_rollout_details=true`` in the agent kwargs. For
-            installed CLI agents, ``policy_proxy`` configures an in-sandbox
-            OpenAI-compatible recorder that forwards to the policy endpoint and
-            emits Harbor-shaped rollout details. Optional Harbor keys include
-            ``agent_model_name``, ``agent_kwargs``, ``rate_limit``,
-            ``mask_failed_prompt_group``, and ``policy_endpoint_env``.
-    """
-
-    name: str
-    kwargs: NotRequired[dict[str, Any]]
-
-
-class SandboxTrajectoryConfig(TypedDict):
-    """Trainability requirements for sandbox-produced trajectories.
-
-    Keys:
-        require_trainable: When true, every assistant turn must include
-            completion token IDs and per-token generation logprobs.
-        reward_key: Optional verifier reward key to read from integration
-            results when multiple reward components are present.
-    """
-
-    require_trainable: bool
-    reward_key: NotRequired[str | None]
 
 
 class SandboxObservabilityArtifactsConfig(TypedDict):
@@ -207,21 +174,3 @@ class SandboxObservabilityConfig(TypedDict):
     wandb: SandboxObservabilityWandbConfig
     process_trace: SandboxObservabilityProcessTraceConfig
     privacy: SandboxObservabilityPrivacyConfig
-
-
-class SandboxConfig(TypedDict):
-    """Top-level sandbox rollout config under ``env.sandbox``.
-
-    Keys:
-        enabled: Enables the sandbox trajectory collector.
-        provider: Runtime/infra provider config.
-        integration: Harness/trajectory integration config.
-        trajectory: Trainability and reward extraction config.
-        observability: Optional sandbox eval observability config.
-    """
-
-    enabled: bool
-    provider: SandboxProviderConfig
-    integration: SandboxIntegrationConfig
-    trajectory: SandboxTrajectoryConfig
-    observability: NotRequired[SandboxObservabilityConfig]
