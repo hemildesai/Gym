@@ -230,6 +230,13 @@ sandbox = [
     # Updated: Sat May 16, 2026 with opensandbox>=0.1.9
     # License: Apache 2.0
     "opensandbox>=0.1.9",
+
+    # OpenTelemetry: optional sandbox observability (per-tool-call OTLP spans +
+    # bounded per-sandbox CPU/mem metrics). Fully env-gated in
+    # nemo_gym.sandbox.observability; safe no-op when disabled.
+    # License: Apache 2.0 https://github.com/open-telemetry/opentelemetry-python/blob/main/LICENSE
+    "opentelemetry-sdk>=1.36.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.36.0",
 ]
 
 # We include dev dependencies as an extra since technically each server module is a consumer (which means we cannot use dependency groups, which are intended to be within a project).

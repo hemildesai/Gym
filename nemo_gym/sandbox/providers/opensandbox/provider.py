@@ -24,6 +24,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from nemo_gym.sandbox import observability as _obs
 from nemo_gym.sandbox.providers.base import (
     SandboxCreateError,
     SandboxCreateVerificationError,
@@ -35,6 +36,20 @@ from nemo_gym.sandbox.providers.base import (
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _classify_command(command: str) -> str:
+    """Coarse, low-cardinality classification of a tool-call command."""
+    head = command.strip().split(maxsplit=1)
+    first = head[0] if head else ""
+    first = first.rsplit("/", 1)[-1]
+    if first in ("python", "python3", "pytest", "py.test"):
+        return "python" if first.startswith("python") else "pytest"
+    if first in ("git", "bash", "sh", "cat", "ls", "cd", "grep", "sed", "find", "echo", "pip", "uv"):
+        return first
+    if "pytest" in command or "tox" in command:
+        return "pytest"
+    return "other"
 
 
 class OpenSandboxCreateError(SandboxCreateError):
@@ -449,6 +464,9 @@ class OpenSandboxProvider:
         self._create = _coerce_config(create, OpenSandboxCreateConfig)
         self._probe = _coerce_config(probe, OpenSandboxProbeConfig)
         self._operations = _coerce_config(operations, OpenSandboxOperationConfig)
+        # sandbox_id -> instance_id, captured at create time so per-tool-call
+        # observability can key resource metrics by trajectory instance.
+        self._instance_ids: dict[str, str] = {}
 
     def _with_default_image_pull_policy(self, spec: SandboxSpec) -> SandboxSpec:
         """Ensure SDK create requests carry the desired image pull policy."""
@@ -744,6 +762,10 @@ class OpenSandboxProvider:
         except Exception:
             await self._cleanup_failed_create_handle(created_handle)
             raise
+        instance_id = spec.metadata.get("instance_id") if spec.metadata else None
+        if instance_id:
+            # _connect_after_create may mint a fresh handle with the same id.
+            self._instance_ids[handle.sandbox_id] = instance_id
         return handle
 
     async def _create_with_retries(
@@ -821,6 +843,12 @@ class OpenSandboxProvider:
         elif isinstance(user, str) and user != "root":
             effective_command = f"su -s /bin/sh -c {shlex.quote(command)} {shlex.quote(user)}"
 
+        # Per-sandbox CPU/mem bracket: wrap the outer command so a single exec
+        # samples the sandbox cgroup v2 leaf before+after the real command.
+        bracket = _obs.cgroup_bracket_enabled()
+        if bracket:
+            effective_command = _obs.wrap_command_with_cgroup_bracket(effective_command)
+
         sdk_timeout_s = (
             float(timeout_s) + 60.0
             if timeout_s is not None
@@ -829,26 +857,47 @@ class OpenSandboxProvider:
             )
         )
         effective_retries = self._command_retry_count() if retries is None else retries
-        execution = await self._await_sdk_operation(
-            lambda: handle.raw.commands.run(effective_command, opts=RunCommandOpts(**opts_kwargs)),
-            operation="command run",
+        instance_id = self._instance_ids.get(handle.sandbox_id)
+        command_class = _classify_command(command)
+        with _obs.tool_call_span(
+            command_class,
             sandbox_id=handle.sandbox_id,
-            timeout_s=sdk_timeout_s,
-            retries=effective_retries,
-        )
-        stdout = "\n".join(msg.text for msg in execution.logs.stdout) or None
-        stderr_parts = [msg.text for msg in execution.logs.stderr]
-        if execution.error is not None:
-            stderr_parts.append(f"{execution.error.name}: {execution.error.value}")
-        stderr = "\n".join(stderr_parts) or None
-        error_type = None
-        if execution.exit_code is not None:
-            return_code = execution.exit_code
-        elif execution.error is not None:
-            return_code = 125
-            error_type = "sandbox"
-        else:
-            return_code = 0
+            instance_id=instance_id,
+            attributes={"sandbox.cgroup_bracket": bracket},
+        ) as span:
+            execution = await self._await_sdk_operation(
+                lambda: handle.raw.commands.run(effective_command, opts=RunCommandOpts(**opts_kwargs)),
+                operation="command run",
+                sandbox_id=handle.sandbox_id,
+                timeout_s=sdk_timeout_s,
+                retries=effective_retries,
+            )
+            stdout = "\n".join(msg.text for msg in execution.logs.stdout) or None
+            stderr_parts = [msg.text for msg in execution.logs.stderr]
+            if execution.error is not None:
+                stderr_parts.append(f"{execution.error.name}: {execution.error.value}")
+            stderr = "\n".join(stderr_parts) or None
+            error_type = None
+            if execution.exit_code is not None:
+                return_code = execution.exit_code
+            elif execution.error is not None:
+                return_code = 125
+                error_type = "sandbox"
+            else:
+                return_code = 0
+
+            if bracket:
+                stderr, deltas = _obs.parse_cgroup_bracket(stderr)
+                if deltas:
+                    _obs.record_tool_call_resources(
+                        span,
+                        sandbox_id=handle.sandbox_id,
+                        instance_id=instance_id,
+                        command_class=command_class,
+                        cpu_seconds=deltas.get("cpu_seconds"),
+                        mem_peak_bytes=deltas.get("mem_peak_bytes"),
+                        mem_current_bytes=deltas.get("mem_current_bytes"),
+                    )
 
         return SandboxExecResult(stdout=stdout, stderr=stderr, return_code=return_code, error_type=error_type)
 
@@ -906,6 +955,7 @@ class OpenSandboxProvider:
 
     async def close(self, handle: SandboxHandle, *, delete: bool) -> None:
         """Close local SDK resources and optionally terminate the sandbox."""
+        self._instance_ids.pop(handle.sandbox_id, None)
         kill_error: Exception | None = None
         if delete:
             try:
