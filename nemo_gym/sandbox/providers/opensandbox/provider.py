@@ -18,6 +18,7 @@ import asyncio
 import logging
 import re
 import shlex
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -762,10 +763,6 @@ class OpenSandboxProvider:
         except Exception:
             await self._cleanup_failed_create_handle(created_handle)
             raise
-        instance_id = spec.metadata.get("instance_id") if spec.metadata else None
-        if instance_id:
-            # _connect_after_create may mint a fresh handle with the same id.
-            self._instance_ids[handle.sandbox_id] = instance_id
         return handle
 
     async def _create_with_retries(
@@ -792,7 +789,14 @@ class OpenSandboxProvider:
     async def create(self, spec: SandboxSpec) -> SandboxHandle:
         """Create one sandbox through the configured OpenSandbox path."""
         spec = self._with_default_image_pull_policy(_normalize_spec(spec))
-        return await self._create_with_retries(spec)
+        handle = await self._create_with_retries(spec)
+        # Record instance_id keyed by the exact handle callers will exec with,
+        # so per-tool-call observability can attribute resource usage by
+        # trajectory instance.
+        instance_id = spec.metadata.get("instance_id") if spec.metadata else None
+        if instance_id:
+            self._instance_ids[handle.sandbox_id] = instance_id
+        return handle
 
     async def status(self, handle: SandboxHandle) -> SandboxStatus:
         """Return the current OpenSandbox lifecycle status."""
@@ -843,10 +847,14 @@ class OpenSandboxProvider:
         elif isinstance(user, str) and user != "root":
             effective_command = f"su -s /bin/sh -c {shlex.quote(command)} {shlex.quote(user)}"
 
-        # Per-sandbox CPU/mem bracket: wrap the outer command so a single exec
-        # samples the sandbox cgroup v2 leaf before+after the real command.
-        bracket = _obs.cgroup_bracket_enabled()
-        if bracket:
+        # Per-sandbox CPU/mem capture mode for this tool call.
+        #   get_metrics -> bracket exec with SDK host-side Sandbox.get_metrics
+        #                  (works on the gVisor/fastlet path).
+        #   cgroup      -> wrap the command with an in-sandbox cgroup v2 read
+        #                  (only on backends that expose the leaf to the guest).
+        resource_mode = _obs.resource_capture_mode()
+        cgroup_in_sandbox = resource_mode == "cgroup"
+        if cgroup_in_sandbox:
             effective_command = _obs.wrap_command_with_cgroup_bracket(effective_command)
 
         sdk_timeout_s = (
@@ -863,8 +871,13 @@ class OpenSandboxProvider:
             command_class,
             sandbox_id=handle.sandbox_id,
             instance_id=instance_id,
-            attributes={"sandbox.cgroup_bracket": bracket},
+            attributes={"sandbox.resource_mode": resource_mode},
         ) as span:
+            metrics_before = None
+            bracket_start = time.monotonic()
+            if resource_mode == "get_metrics":
+                metrics_before = await self._sample_metrics(handle)
+
             execution = await self._await_sdk_operation(
                 lambda: handle.raw.commands.run(effective_command, opts=RunCommandOpts(**opts_kwargs)),
                 operation="command run",
@@ -872,6 +885,23 @@ class OpenSandboxProvider:
                 timeout_s=sdk_timeout_s,
                 retries=effective_retries,
             )
+
+            if resource_mode == "get_metrics":
+                metrics_after = await self._sample_metrics(handle)
+                elapsed_s = max(0.0, time.monotonic() - bracket_start)
+                if metrics_before is not None and metrics_after is not None:
+                    deltas = _obs.metrics_delta_from_samples(metrics_before, metrics_after, elapsed_s)
+                    if deltas:
+                        _obs.record_tool_call_resources(
+                            span,
+                            sandbox_id=handle.sandbox_id,
+                            instance_id=instance_id,
+                            command_class=command_class,
+                            cpu_seconds=deltas.get("cpu_seconds"),
+                            mem_peak_bytes=deltas.get("mem_peak_bytes"),
+                            mem_current_bytes=deltas.get("mem_current_bytes"),
+                        )
+
             stdout = "\n".join(msg.text for msg in execution.logs.stdout) or None
             stderr_parts = [msg.text for msg in execution.logs.stderr]
             if execution.error is not None:
@@ -886,7 +916,7 @@ class OpenSandboxProvider:
             else:
                 return_code = 0
 
-            if bracket:
+            if cgroup_in_sandbox:
                 stderr, deltas = _obs.parse_cgroup_bracket(stderr)
                 if deltas:
                     _obs.record_tool_call_resources(
@@ -900,6 +930,22 @@ class OpenSandboxProvider:
                     )
 
         return SandboxExecResult(stdout=stdout, stderr=stderr, return_code=return_code, error_type=error_type)
+
+    async def _sample_metrics(self, handle: SandboxHandle) -> Any | None:
+        """Best-effort host-side per-sandbox metrics sample (CPU%/mem)."""
+        get_metrics = getattr(handle.raw, "get_metrics", None)
+        if get_metrics is None:
+            return None
+        try:
+            return await self._await_sdk_call(
+                get_metrics(),
+                operation="get_metrics",
+                sandbox_id=handle.sandbox_id,
+                timeout_s=float(self._operations.close_timeout_s or 30),
+            )
+        except Exception as exc:  # pragma: no cover - best effort
+            LOGGER.debug("get_metrics sample failed for %s: %r", handle.sandbox_id, exc)
+            return None
 
     async def exec(
         self,

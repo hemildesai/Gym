@@ -71,8 +71,34 @@ def traces_enabled() -> bool:
 
 
 def cgroup_bracket_enabled() -> bool:
-    """Whether the provider should bracket execs with a cgroup read."""
-    return _env_flag("NG_OBS_SANDBOX_CGROUP_BRACKET", False)
+    """Whether the provider should bracket execs with an in-sandbox cgroup read.
+
+    NOTE: gVisor/fastlet sandboxes do NOT expose the host cgroup v2 leaf to the
+    guest (``/sys/fs/cgroup/cpu.stat`` is absent inside the sandbox), so this
+    in-sandbox mode only yields data on non-gVisor backends that bind-mount the
+    leaf. For the fastlet path use ``NG_OBS_SANDBOX_RESOURCE_MODE=get_metrics``
+    (the default), which brackets the exec with the SDK's host-side
+    ``Sandbox.get_metrics`` (per-sandbox CPU%/mem from the fastlet cgroup leaf).
+    """
+    return resource_capture_mode() == "cgroup"
+
+
+def resource_capture_mode() -> str:
+    """How to capture per-tool-call CPU/mem: ``get_metrics`` | ``cgroup`` | ``off``.
+
+    ``get_metrics`` brackets each exec with ``Sandbox.get_metrics`` (host-side,
+    works on the fastlet path). ``cgroup`` wraps the command with an in-sandbox
+    cgroup v2 leaf read (only on backends that expose the leaf to the guest).
+    Defaults to ``get_metrics`` when NG_OBS_SANDBOX_CGROUP_BRACKET is enabled,
+    otherwise ``off``.
+    """
+    mode = os.environ.get("NG_OBS_SANDBOX_RESOURCE_MODE")
+    if mode:
+        return mode.strip().lower()
+    # Back-compat: the bracket toggle defaults to the host-side get_metrics path.
+    if _env_flag("NG_OBS_SANDBOX_CGROUP_BRACKET", False):
+        return "get_metrics"
+    return "off"
 
 
 def cgroup_path() -> str:
@@ -222,6 +248,38 @@ def tool_call_span(
 
     with tracer.start_as_current_span("sandbox.exec", attributes=span_attrs) as span:
         yield span
+
+
+_MIB = 1024 * 1024
+
+
+def metrics_delta_from_samples(before: Any, after: Any, elapsed_s: float) -> dict[str, Any]:
+    """Compute per-tool-call CPU/mem from two ``SandboxMetrics`` samples.
+
+    ``SandboxMetrics`` exposes instantaneous ``cpu_used_percentage`` (0-100 of
+    one core, scaled by ``cpu_count``), ``memory_used_in_mib`` and
+    ``memory_total_in_mib``. CPU-seconds for the tool call is estimated by
+    integrating the mean of the before/after CPU% over the bracket interval;
+    peak memory is the max observed ``memory_used_in_mib`` across the bracket.
+    """
+    deltas: dict[str, Any] = {}
+    try:
+        cpu_count = float(getattr(after, "cpu_count", None) or getattr(before, "cpu_count", None) or 1.0)
+        pct_before = float(getattr(before, "cpu_used_percentage", 0.0) or 0.0)
+        pct_after = float(getattr(after, "cpu_used_percentage", 0.0) or 0.0)
+        # cpu_used_percentage is per-core utilization (0-100); convert to cores busy.
+        mean_cores = (pct_before + pct_after) / 2.0 / 100.0 * cpu_count
+        if elapsed_s > 0:
+            deltas["cpu_seconds"] = max(0.0, mean_cores * elapsed_s)
+        mem_before = float(getattr(before, "memory_used_in_mib", 0.0) or 0.0)
+        mem_after = float(getattr(after, "memory_used_in_mib", 0.0) or 0.0)
+        peak_mib = max(mem_before, mem_after)
+        if peak_mib > 0:
+            deltas["mem_peak_bytes"] = int(peak_mib * _MIB)
+            deltas["mem_current_bytes"] = int(mem_after * _MIB)
+    except Exception:  # pragma: no cover - best effort
+        return {}
+    return deltas
 
 
 def record_tool_call_resources(
