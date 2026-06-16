@@ -1,6 +1,6 @@
 policy_base_url: ${oc.env:NVIDIA_INFERENCE_BASE_URL,https://inference-api.nvidia.com/v1}
 policy_api_key: ${oc.env:NVIDIA_API_KEY}
-policy_model_name: ${oc.env:NVIDIA_INFERENCE_MODEL,qwen/qwen3-coder-480b-a35b-instruct}
+policy_model_name: ${oc.env:NVIDIA_INFERENCE_MODEL,nvidia/eccn-nemotron-3-ultra}
 
 policy_model:
   responses_api_models:
