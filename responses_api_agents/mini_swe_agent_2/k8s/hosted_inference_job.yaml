@@ -1,0 +1,96 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mini-swe-agent-2-hosted-inference
+data:
+  NVIDIA_INFERENCE_BASE_URL: "https://inference-api.nvidia.com/v1"
+  NVIDIA_INFERENCE_MODEL: "qwen/qwen3-coder-480b-a35b-instruct"
+  INPUT_JSONL_FPATH: "/workspace/data/mini_swe_verified_smoke8.jsonl"
+  OUTPUT_JSONL_FPATH: "/workspace/results/mini_swe_agent_2_hosted_inference_rollouts.jsonl"
+  LIMIT: "8"
+  NUM_REPEATS: "1"
+  NUM_SAMPLES_IN_PARALLEL: "8"
+  MAX_OUTPUT_TOKENS: "16384"
+  TEMPERATURE: "0.6"
+  TOP_P: "0.95"
+  MINI_SWE_CONCURRENCY: "8"
+  STEP_TIMEOUT: "600"
+  EVAL_TIMEOUT: "1800"
+  STEP_LIMIT: "50"
+  SANDBOX_CPU: "0.5"
+  SANDBOX_MEMORY_MIB: "4096"
+  SANDBOX_DISK_GIB: "8"
+  SERVER_READY_TIMEOUT_S: "900"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mini-swe-agent-2-hosted-inference
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: runner
+          image: nemo-gym:latest
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace/Gym
+          envFrom:
+            - configMapRef:
+                name: mini-swe-agent-2-hosted-inference
+          env:
+            - name: NVIDIA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nvidia-inference
+                  key: api-key
+            - name: OPENSANDBOX_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: opensandbox
+                  key: api-key
+          command:
+            - /bin/bash
+            - -lc
+          args:
+            - |
+              set -euo pipefail
+
+              CONFIG_PATHS="responses_api_agents/mini_swe_agent_2/configs/mini_swe_agent_opensandbox.yaml,responses_api_agents/mini_swe_agent_2/configs/hosted_inference_model.yaml"
+              mkdir -p "$(dirname "${OUTPUT_JSONL_FPATH}")"
+
+              ng_run "+config_paths=[${CONFIG_PATHS}]" \
+                "+mini_swe_agent_2.responses_api_agents.mini_swe_agent_2.concurrency=${MINI_SWE_CONCURRENCY}" \
+                "+mini_swe_agent_2.responses_api_agents.mini_swe_agent_2.step_timeout=${STEP_TIMEOUT}" \
+                "+mini_swe_agent_2.responses_api_agents.mini_swe_agent_2.eval_timeout=${EVAL_TIMEOUT}" \
+                "+mini_swe_agent_2.responses_api_agents.mini_swe_agent_2.step_limit=${STEP_LIMIT}" \
+                "+mini_swe_agent_2.responses_api_agents.mini_swe_agent_2.run_golden=false" \
+                "+mini_swe_agent_2.responses_api_agents.mini_swe_agent_2.sandbox_spec.resources={cpu: ${SANDBOX_CPU}, memory_mib: ${SANDBOX_MEMORY_MIB}, disk_gib: ${SANDBOX_DISK_GIB}}" \
+                "+mini_swe_agent_2.responses_api_agents.mini_swe_agent_2.sandbox_spec.metadata={benchmark: swebench-verified, harness: mini_swe_agent_2, endpoint_label: nvidia-hosted-inference}" &
+              NG_RUN_PID=$!
+
+              cleanup() {
+                kill "${NG_RUN_PID}" 2>/dev/null || true
+                wait "${NG_RUN_PID}" 2>/dev/null || true
+              }
+              trap cleanup EXIT
+
+              ./scripts/wait_for_servers.sh "${NG_RUN_PID}" 11000 "${SERVER_READY_TIMEOUT_S}"
+
+              ng_collect_rollouts \
+                +agent_name=mini_swe_agent_2 \
+                "+input_jsonl_fpath=${INPUT_JSONL_FPATH}" \
+                "+output_jsonl_fpath=${OUTPUT_JSONL_FPATH}" \
+                "+limit=${LIMIT}" \
+                "+num_repeats=${NUM_REPEATS}" \
+                "+num_samples_in_parallel=${NUM_SAMPLES_IN_PARALLEL}" \
+                "+responses_create_params={max_output_tokens: ${MAX_OUTPUT_TOKENS}, temperature: ${TEMPERATURE}, top_p: ${TOP_P}}"
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+            limits:
+              cpu: "4"
+              memory: 16Gi
